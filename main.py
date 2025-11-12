@@ -3,7 +3,7 @@ import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import ReplyKeyboardRemove
+from aiogram.types import ReplyKeyboardRemove, ReplyKeyboardMarkup, KeyboardButton
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -23,9 +23,7 @@ engine = create_async_engine(DATABASE_URL, echo=True, poolclass=NullPool)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 # Импортируем модели после создания engine
-from models import Base, User, QuizAnswer, ReferralLink
-from utils import content_manager
-import handlers
+from models import Base, User
 
 async def create_tables():
     """Создаем таблицы в базе данных"""
@@ -49,17 +47,7 @@ async def get_user(tg_id: int, username: str = None, first_name: str = None):
             logger.info(f"Создан новый пользователь: {first_name} (ID: {tg_id})")
         return user
 
-async def save_quiz_answer(user_id: int, question_id: str, answer: str):
-    """Сохраняет ответ на вопрос квиза"""
-    async with AsyncSessionLocal() as session:
-        quiz_answer = QuizAnswer(
-            user_id=user_id,
-            question_id=question_id,
-            answer=answer
-        )
-        session.add(quiz_answer)
-        await session.commit()
-
+# ОБРАБОТЧИК КОМАНДЫ /START
 @dp.message(CommandStart())
 async def start_command(message: types.Message):
     # Определяем источник (реферальная ссылка)
@@ -81,16 +69,33 @@ async def start_command(message: types.Message):
         message.from_user.username,
         message.from_user.first_name
     )
-    user.source = source
-    user.scenario = scenario
     
-    # Получаем контент для сценария
-    text = content_manager.get_text("start", scenario)
+    # Обновляем источник и сценарий
+    async with AsyncSessionLocal() as session:
+        db_user = await session.get(User, message.from_user.id)
+        db_user.source = source
+        db_user.scenario = scenario
+        await session.commit()
     
-    await message.answer(text, reply_markup=ReplyKeyboardRemove())
+    # Создаем клавиатуру с кнопками
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Начать тест")],
+            [KeyboardButton(text="О проекте"), KeyboardButton(text="Помощь")]
+        ],
+        resize_keyboard=True
+    )
+    
+    await message.answer(
+        "🎉 Добро пожаловать в GenoLife!\n\n"
+        "Я помогу вам пройти анализ и улучшить здоровье.\n\n"
+        "Выберите действие:",
+        reply_markup=keyboard
+    )
     
     logger.info(f"Пользователь {user.first_name} пришел из: {source}, сценарий: {scenario}")
 
+# ОБРАБОТЧИК КОМАНДЫ /PROFILE
 @dp.message(Command("profile"))
 async def profile_command(message: types.Message):
     """Показывает профиль пользователя"""
@@ -104,11 +109,60 @@ async def profile_command(message: types.Message):
                 f"Статус: {user.status}\n"
                 f"Источник: {user.source or 'не указан'}\n"
                 f"Сценарий: {user.scenario}\n"
-                f"Зарегистрирован: {user.created_at.strftime('%d.%m.%Y')}"
+                f"Зарегистрирован: {user.created_at.strftime('%d.%m.%Y')}",
+                reply_markup=ReplyKeyboardRemove()
             )
 
-# Регистрируем обработчики
-dp.include_router(handlers.router)
+# ОБРАБОТЧИК КОМАНДЫ /HELP
+@dp.message(Command("help"))
+async def help_command(message: types.Message):
+    await message.answer(
+        "❓ Помощь по боту:\n\n"
+        "/start - начать работу\n"
+        "/profile - ваш профиль\n"
+        "/help - помощь\n\n"
+        "Или используйте кнопки меню!"
+    )
+
+# ОБРАБОТЧИК КНОПКИ "НАЧАТЬ ТЕСТ"
+@dp.message(F.text == "Начать тест")
+async def start_test_handler(message: types.Message):
+    await message.answer(
+        "🧪 Отлично! Начинаем тест...\n\n"
+        "Вопрос 1: Как часто вы чувствуете усталость?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Часто"), KeyboardButton(text="Иногда")],
+                [KeyboardButton(text="Редко"), KeyboardButton(text="Никогда")]
+            ],
+            resize_keyboard=True
+        )
+    )
+
+# ОБРАБОТЧИК КНОПКИ "О ПРОЕКТЕ"
+@dp.message(F.text == "О проекте")
+async def about_handler(message: types.Message):
+    await message.answer(
+        "🏥 GenoLife - это современная система анализа здоровья\n\n"
+        "Мы помогаем:\n"
+        "• Пройти генетический анализ\n"
+        "• Получить персональные рекомендации\n"
+        "• Улучшить качество жизни"
+    )
+
+# ОБРАБОТЧИК КНОПКИ "ПОМОЩЬ"
+@dp.message(F.text == "Помощь")
+async def help_button_handler(message: types.Message):
+    await help_command(message)
+
+# ОБРАБОТЧИК ЛЮБОГО ТЕКСТА (если не распознано)
+@dp.message()
+async def echo_handler(message: types.Message):
+    await message.answer(
+        "🤔 Я вас не понял. Используйте кнопки меню или команды:\n"
+        "/start - начать работу\n"
+        "/help - помощь"
+    )
 
 async def main():
     logger.info("🚀 Запуск бота GenoLife...")
