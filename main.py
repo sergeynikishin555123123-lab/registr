@@ -3,7 +3,7 @@ import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import ReplyKeyboardRemove, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardRemove
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -23,14 +23,16 @@ engine = create_async_engine(DATABASE_URL, echo=True, poolclass=NullPool)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 # Импортируем модели после создания engine
-from models import Base, User
+from models import Base, User, QuizAnswer, ReferralLink
+from utils import content_manager
+import handlers
 
 async def create_tables():
     """Создаем таблицы в базе данных"""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-async def get_or_create_user(tg_id: int, username: str, first_name: str):
+async def get_user(tg_id: int, username: str = None, first_name: str = None):
     """Получаем или создаем пользователя"""
     async with AsyncSessionLocal() as session:
         user = await session.get(User, tg_id)
@@ -47,27 +49,47 @@ async def get_or_create_user(tg_id: int, username: str, first_name: str):
             logger.info(f"Создан новый пользователь: {first_name} (ID: {tg_id})")
         return user
 
+async def save_quiz_answer(user_id: int, question_id: str, answer: str):
+    """Сохраняет ответ на вопрос квиза"""
+    async with AsyncSessionLocal() as session:
+        quiz_answer = QuizAnswer(
+            user_id=user_id,
+            question_id=question_id,
+            answer=answer
+        )
+        session.add(quiz_answer)
+        await session.commit()
+
 @dp.message(CommandStart())
 async def start_command(message: types.Message):
+    # Определяем источник (реферальная ссылка)
+    source = 'direct'
+    scenario = 'default'
+    
+    if len(message.text.split()) > 1:
+        source = message.text.split()[1]  # /start src_bloggerName
+        
+        # Определяем сценарий по источнику
+        if 'blogger1' in source:
+            scenario = 'blogger1'
+        elif 'blogger2' in source:
+            scenario = 'blogger2'
+    
     # Сохраняем пользователя в БД
-    user = await get_or_create_user(
+    user = await get_user(
         message.from_user.id,
         message.from_user.username,
         message.from_user.first_name
     )
+    user.source = source
+    user.scenario = scenario
     
-    # Проверяем источник (реферальная ссылка)
-    if len(message.text.split()) > 1:
-        source = message.text.split()[1]  # /start src_bloggerName
-        user.source = source
-        logger.info(f"Пользователь {user.first_name} пришел из источника: {source}")
+    # Получаем контент для сценария
+    text = content_manager.get_text("start", scenario)
     
-    await message.answer(
-        "🎉 Добро пожаловать в GenoLife!\n\n"
-        "Я помогу вам пройти анализ и улучшить здоровье.\n\n"
-        "Начнем с быстрого теста?",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    await message.answer(text, reply_markup=ReplyKeyboardRemove())
+    
+    logger.info(f"Пользователь {user.first_name} пришел из: {source}, сценарий: {scenario}")
 
 @dp.message(Command("profile"))
 async def profile_command(message: types.Message):
@@ -81,8 +103,12 @@ async def profile_command(message: types.Message):
                 f"Username: @{user.username}\n"
                 f"Статус: {user.status}\n"
                 f"Источник: {user.source or 'не указан'}\n"
+                f"Сценарий: {user.scenario}\n"
                 f"Зарегистрирован: {user.created_at.strftime('%d.%m.%Y')}"
             )
+
+# Регистрируем обработчики
+dp.include_router(handlers.router)
 
 async def main():
     logger.info("🚀 Запуск бота GenoLife...")
