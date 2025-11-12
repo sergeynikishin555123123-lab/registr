@@ -1,6 +1,0 @@
-aiogram==3.17
-sqlalchemy==2.0.23
-asyncpg==0.29.0
-python-dotenv==1.0.0
-apscheduler==3.10.4
-alembic==1.13.0
