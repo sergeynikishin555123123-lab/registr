@@ -96,7 +96,7 @@ class ReferralLink(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # Database setup
-engine = create_async_engine(config.DATABASE_URL, echo=False)
+engine = create_async_engine(config.DATABASE_URL, echo=True)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 async def create_tables():
@@ -105,23 +105,26 @@ async def create_tables():
         await conn.run_sync(Base.metadata.create_all)
     logger.info("✅ Таблицы базы данных созданы")
 
-async def get_user_by_tg_id(tg_id: int) -> User:
+async def get_user_by_tg_id(tg_id: int):
     """Получаем пользователя по Telegram ID"""
     async with AsyncSessionLocal() as session:
         result = await session.execute(text("SELECT * FROM users WHERE tg_id = :tg_id"), {"tg_id": tg_id})
         user_data = result.fetchone()
         if user_data:
-            return User(**dict(user_data._mapping))
+            # Создаем объект User из данных строки
+            user_dict = dict(user_data._mapping)
+            return User(**user_dict)
         return None
 
-async def get_or_create_user(tg_id: int, username: str, first_name: str, source: str = 'direct') -> User:
+async def get_or_create_user(tg_id: int, username: str, first_name: str, source: str = 'direct'):
     """Получаем или создаем пользователя"""
     async with AsyncSessionLocal() as session:
         # Пытаемся найти существующего пользователя
-        user = await get_user_by_tg_id(tg_id)
+        existing_user = await get_user_by_tg_id(tg_id)
         
-        if user:
-            # Обновляем данные
+        if existing_user:
+            # Обновляем данные существующего пользователя
+            user = await session.get(User, existing_user.id)
             user.username = username
             user.first_name = first_name
             user.source = source
@@ -130,7 +133,7 @@ async def get_or_create_user(tg_id: int, username: str, first_name: str, source:
             logger.info(f"✅ Обновлен пользователь: {first_name} (ID: {user.id})")
             return user
         else:
-            # Создаем нового
+            # Создаем нового пользователя
             user = User(
                 tg_id=tg_id,
                 username=username,
