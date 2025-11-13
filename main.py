@@ -6,7 +6,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import ReplyKeyboardRemove, ReplyKeyboardMarkup, KeyboardButton
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import Column, Integer, String, BigInteger, DateTime
+from sqlalchemy import Column, Integer, String, BigInteger, DateTime, Text
 from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime
 
@@ -32,6 +32,14 @@ class User(Base):
     status = Column(String(50), default='lead')
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class QuizAnswer(Base):
+    __tablename__ = "quiz_answers"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
+    question_id = Column(String(100))
+    answer = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 # Подключение к PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL").replace("postgresql://", "postgresql+asyncpg://")
 engine = create_async_engine(DATABASE_URL, echo=True)
@@ -46,7 +54,6 @@ async def create_tables():
 async def get_or_create_user(tg_id: int, username: str, first_name: str, source: str = 'direct'):
     """Получаем или создаем пользователя"""
     async with AsyncSessionLocal() as session:
-        # Пробуем найти пользователя
         from sqlalchemy import select
         result = await session.execute(select(User).where(User.tg_id == tg_id))
         user = result.scalar_one_or_none()
@@ -61,11 +68,24 @@ async def get_or_create_user(tg_id: int, username: str, first_name: str, source:
             )
             session.add(user)
             await session.commit()
+            await session.refresh(user)
             logger.info(f"✅ Создан новый пользователь: {first_name}")
         else:
             logger.info(f"✅ Найден существующий пользователь: {first_name}")
         
         return user
+
+async def save_quiz_answer(user_id: int, question_id: str, answer: str):
+    """Сохраняет ответ на вопрос квиза"""
+    async with AsyncSessionLocal() as session:
+        quiz_answer = QuizAnswer(
+            user_id=user_id,
+            question_id=question_id,
+            answer=answer
+        )
+        session.add(quiz_answer)
+        await session.commit()
+        logger.info(f"💾 Сохранен ответ: {question_id} = {answer}")
 
 # ОБРАБОТЧИК /start
 @dp.message(CommandStart())
@@ -132,12 +152,72 @@ async def profile_command(message: types.Message):
 async def start_test_handler(message: types.Message):
     await message.answer(
         "🧪 Отлично! Начинаем тест...\n\n"
-        "Вопрос 1: Как часто вы чувствуете усталость?",
+        "❓ Вопрос 1: Как часто вы чувствуете усталость?",
         reply_markup=ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="😫 Часто"), KeyboardButton(text="😐 Иногда")],
                 [KeyboardButton(text="😊 Редко"), KeyboardButton(text="🎉 Никогда")],
                 [KeyboardButton(text="🔙 Назад")]
+            ],
+            resize_keyboard=True
+        )
+    )
+
+# ОБРАБОТЧИКИ ОТВЕТОВ НА ВОПРОС 1
+@dp.message(F.text.in_(["😫 Часто", "😐 Иногда", "😊 Редко", "🎉 Никогда"]))
+async def question1_handler(message: types.Message):
+    # Сохраняем ответ
+    await save_quiz_answer(message.from_user.id, "question1_fatigue", message.text)
+    
+    # Следующий вопрос
+    await message.answer(
+        f"✅ Ответ сохранен: {message.text}\n\n"
+        "❓ Вопрос 2: Какой у вас обычно сон?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="😴 Крепкий"), KeyboardButton(text="🛌 Беспокойный")],
+                [KeyboardButton(text="⏰ Прерывистый"), KeyboardButton(text="💤 Бессонница")],
+                [KeyboardButton(text="🔙 Назад")]
+            ],
+            resize_keyboard=True
+        )
+    )
+
+# ОБРАБОТЧИКИ ОТВЕТОВ НА ВОПРОС 2
+@dp.message(F.text.in_(["😴 Крепкий", "🛌 Беспокойный", "⏰ Прерывистый", "💤 Бессонница"]))
+async def question2_handler(message: types.Message):
+    # Сохраняем ответ
+    await save_quiz_answer(message.from_user.id, "question2_sleep", message.text)
+    
+    # Следующий вопрос
+    await message.answer(
+        f"✅ Ответ сохранен: {message.text}\n\n"
+        "❓ Вопрос 3: Как часто вы занимаетесь спортом?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="💪 Регулярно"), KeyboardButton(text="🚶 Иногда")],
+                [KeyboardButton(text="🧘 Редко"), KeyboardButton(text="🚫 Никогда")],
+                [KeyboardButton(text="🔙 Назад")]
+            ],
+            resize_keyboard=True
+        )
+    )
+
+# ОБРАБОТЧИКИ ОТВЕТОВ НА ВОПРОС 3
+@dp.message(F.text.in_(["💪 Регулярно", "🚶 Иногда", "🧘 Редко", "🚫 Никогда"]))
+async def question3_handler(message: types.Message):
+    # Сохраняем ответ
+    await save_quiz_answer(message.from_user.id, "question3_sport", message.text)
+    
+    # Завершение теста
+    await message.answer(
+        f"✅ Ответ сохранен: {message.text}\n\n"
+        "🎉 Тест завершен! Спасибо за ответы!\n\n"
+        "На основе ваших ответов мы подготовим персональные рекомендации.",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="🧪 Начать тест")],
+                [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="ℹ️ О проекте")]
             ],
             resize_keyboard=True
         )
@@ -176,7 +256,7 @@ async def echo_handler(message: types.Message):
     )
 
 async def main():
-    logger.info("🚀 Запуск бота GenoLife с базой данных...")
+    logger.info("🚀 Запуск бота GenoLife с квизом...")
     
     # Создаем таблицы
     try:
