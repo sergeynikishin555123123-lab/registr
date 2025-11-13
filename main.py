@@ -14,9 +14,8 @@ from config import config
 from database import (
     get_user_by_tg_id, get_or_create_user, create_tables, 
     create_order, save_quiz_answer, update_order_payment, update_user_status,
-    get_user_orders, cleanup_duplicate_users, AsyncSessionLocal
+    update_user_contact, update_user_timezone, get_user_orders, cleanup_duplicate_users
 )
-from content_manager import content_manager
 
 # Настройка логирования
 logging.basicConfig(
@@ -286,26 +285,9 @@ async def test_payment_handler(callback: types.CallbackQuery, state: FSMContext)
             return
         
         # Обновляем пользователя
-        async with AsyncSessionLocal() as session:
-            from sqlalchemy import text
-            result = await session.execute(
-                text("SELECT user_id FROM orders WHERE id = :order_id"),
-                {"order_id": order_id}
-            )
-            order_data = result.fetchone()
-            if order_data:
-                user_id = order_data[0]
-                await update_user_status(user_id, 'paid')
-                
-                # Получаем данные пользователя для уведомления
-                user_result = await session.execute(
-                    text("SELECT first_name, username FROM users WHERE id = :user_id"),
-                    {"user_id": user_id}
-                )
-                user_data = user_result.fetchone()
-                if user_data:
-                    user_name = user_data[0]
-                    user_username = user_data[1]
+        user = await get_user_by_tg_id(callback.from_user.id)
+        if user:
+            await update_user_status(user.id, 'paid')
         
         await callback.message.answer(
             "🎉 *Оплата подтверждена! Спасибо за заказ!*\n\n"
@@ -321,8 +303,8 @@ async def test_payment_handler(callback: types.CallbackQuery, state: FSMContext)
         await callback.answer("✅ Тестовая оплата подтверждена!")
         
         # Уведомление менеджеру
-        if user_data:
-            await notify_managers(f"💰 Новая оплата от {user_name} (@{user_username})")
+        if user:
+            await notify_managers(f"💰 Новая оплата от {user.first_name} (@{user.username})")
             
     except Exception as e:
         logger.error(f"❌ Ошибка тестовой оплаты: {e}")
@@ -341,16 +323,9 @@ async def confirm_payment_handler(callback: types.CallbackQuery, state: FSMConte
             return
         
         # Обновляем пользователя
-        async with AsyncSessionLocal() as session:
-            from sqlalchemy import text
-            result = await session.execute(
-                text("SELECT user_id FROM orders WHERE id = :order_id"),
-                {"order_id": order_id}
-            )
-            order_data = result.fetchone()
-            if order_data:
-                user_id = order_data[0]
-                await update_user_status(user_id, 'paid')
+        user = await get_user_by_tg_id(callback.from_user.id)
+        if user:
+            await update_user_status(user.id, 'paid')
         
         await callback.message.answer(
             "🎉 *Оплата подтверждена! Спасибо за заказ!*\n\n"
@@ -471,15 +446,9 @@ async def contact_received_handler(message: types.Message, state: FSMContext):
     phone = message.contact.phone_number
     
     # Сохраняем телефон
-    async with AsyncSessionLocal() as session:
-        user = await get_user_by_tg_id(message.from_user.id)
-        if user:
-            from sqlalchemy import text
-            await session.execute(
-                text("UPDATE users SET phone = :phone WHERE id = :user_id"),
-                {"phone": phone, "user_id": user.id}
-            )
-            await session.commit()
+    user = await get_user_by_tg_id(message.from_user.id)
+    if user:
+        await update_user_contact(user.id, phone)
     
     # Предлагаем выбрать часовой пояс
     timezone_keyboard = ReplyKeyboardMarkup(
@@ -512,15 +481,15 @@ async def timezone_handler(message: types.Message, state: FSMContext):
         timezone = timezone_map[message.text]
         
         # Сохраняем часовой пояс
-        async with AsyncSessionLocal() as session:
-            user = await get_user_by_tg_id(message.from_user.id)
-            if user:
-                from sqlalchemy import text
-                await session.execute(
-                    text("UPDATE users SET timezone = :timezone WHERE id = :user_id"),
-                    {"timezone": timezone, "user_id": user.id}
-                )
-                await session.commit()
+        user = await get_user_by_tg_id(message.from_user.id)
+        if user:
+            city = None
+            if message.text == "Определить по городу":
+                city = "auto"
+            else:
+                city = message.text.split(' ')[0]  # Берем название города
+            
+            await update_user_timezone(user.id, timezone, city)
         
         # Завершаем процесс
         main_keyboard = ReplyKeyboardMarkup(
@@ -542,7 +511,6 @@ async def timezone_handler(message: types.Message, state: FSMContext):
         await state.clear()
         
         # Уведомление менеджеру
-        user = await get_user_by_tg_id(message.from_user.id)
         if user:
             await notify_managers(
                 f"🆕 *НОВЫЙ ЗАКАЗ!*\n\n"
@@ -608,10 +576,6 @@ async def main():
     try:
         await create_tables()
         logger.info("✅ База данных настроена")
-        
-        # Загружаем контент
-        content_manager.load_content()
-        logger.info("✅ Контент загружен")
         
         # Тестовое сообщение админу
         await bot.send_message(config.ADMIN_ID, "🤖 Бот GenoLife запущен и готов к работе!")
