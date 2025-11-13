@@ -115,15 +115,56 @@ async def setup_database():
     await create_tables()
     await add_missing_columns()
     await cleanup_orders()
+    await cleanup_duplicate_users()  # ДОБАВЛЯЕМ ОЧИСТКУ ДУБЛЕЙ
     logger.info("✅ База данных полностью настроена")
 
 async def get_user(tg_id: int):
     """Получаем пользователя из БД по tg_id"""
     async with AsyncSessionLocal() as session:
-        result = await session.execute(select(User).where(User.tg_id == tg_id))
-        user = result.scalar_one_or_none()
-        logger.info(f"🔍 Поиск пользователя {tg_id}: {'найден' if user else 'не найден'}")
-        return user
+        try:
+            result = await session.execute(select(User).where(User.tg_id == tg_id))
+            user = result.scalar_one_or_none()
+            logger.info(f"🔍 Поиск пользователя {tg_id}: {'найден' if user else 'не найден'}")
+            return user
+        except Exception as e:
+            logger.error(f"❌ Ошибка при поиске пользователя {tg_id}: {e}")
+            # Если есть дубли, берем первого
+            result = await session.execute(select(User).where(User.tg_id == tg_id))
+            users = result.scalars().all()
+            if users:
+                logger.warning(f"⚠️ Найдено дублирующихся пользователей: {len(users)}")
+                return users[0]  # Возвращаем первого
+            return None
+
+async def cleanup_duplicate_users():
+    """Удаляет дублирующихся пользователей"""
+    async with AsyncSessionLocal() as session:
+        # Находим дублирующиеся tg_id
+        result = await session.execute(text("""
+            SELECT tg_id, COUNT(*) as count 
+            FROM users 
+            GROUP BY tg_id 
+            HAVING COUNT(*) > 1
+        """))
+        duplicates = result.fetchall()
+        
+        for tg_id, count in duplicates:
+            logger.warning(f"🔄 Найдены дубли для tg_id {tg_id}: {count} записей")
+            
+            # Оставляем самую новую запись, удаляем остальные
+            await session.execute(text("""
+                DELETE FROM users 
+                WHERE tg_id = :tg_id 
+                AND id NOT IN (
+                    SELECT id FROM users 
+                    WHERE tg_id = :tg_id 
+                    ORDER BY created_at DESC 
+                    LIMIT 1
+                )
+            """), {"tg_id": tg_id})
+            
+        await session.commit()
+        logger.info(f"✅ Удалено дублирующихся пользователей: {len(duplicates)}")
 
 # ОБРАБОТЧИК ПРОФИЛЯ (ИСПРАВЛЕННЫЙ)
 @dp.message(Command("profile"))
@@ -218,9 +259,19 @@ async def order_status_handler(message: types.Message):
 async def get_or_create_user(tg_id: int, username: str, first_name: str, source: str = 'direct'):
     """Получаем или создаем пользователя"""
     async with AsyncSessionLocal() as session:
+        # Сначала проверяем есть ли пользователь
         user = await get_user(tg_id)
         
-        if not user:
+        if user:
+            # Обновляем данные существующего пользователя
+            user.username = username
+            user.first_name = first_name
+            user.source = source
+            await session.commit()
+            logger.info(f"✅ Обновлен существующий пользователь: {first_name} (ID: {user.id})")
+            return user
+        else:
+            # Создаем нового пользователя
             user = User(
                 tg_id=tg_id,
                 username=username,
@@ -231,11 +282,8 @@ async def get_or_create_user(tg_id: int, username: str, first_name: str, source:
             session.add(user)
             await session.commit()
             await session.refresh(user)
-            logger.info(f"✅ Создан новый пользователь: {first_name}")
-        else:
-            logger.info(f"✅ Найден существующий пользователь: {first_name}")
-        
-        return user
+            logger.info(f"✅ Создан новый пользователь: {first_name} (ID: {user.id})")
+            return user
 
 async def save_quiz_answer(user_id: int, question_id: str, answer: str):
     """Сохраняет ответ на вопрос квиза"""
@@ -275,6 +323,16 @@ async def create_order(user_id: int, amount: float):
 class OrderStates(StatesGroup):
     waiting_contacts = State()
     waiting_timezone = State()
+
+@dp.message(Command("cleanup"))
+async def cleanup_command(message: types.Message):
+    """Команда для принудительной очистки дублей"""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Доступ запрещен")
+        return
+        
+    await cleanup_duplicate_users()
+    await message.answer("✅ Дублирующиеся пользователи очищены")
 
 # ОБРАБОТЧИК /start
 @dp.message(CommandStart())
