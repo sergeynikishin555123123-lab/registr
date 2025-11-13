@@ -374,66 +374,118 @@ async def payment_confirmation_handler(callback: types.CallbackQuery, state: FSM
         logger.error(f"❌ Ошибка при подтверждении оплаты: {e}")
         await callback.answer("❌ Произошла ошибка")
 
-# ОБРАБОТЧИК КОНТАКТОВ
+# ОТЛАДОЧНЫЙ ОБРАБОТЧИК - что происходит при отправке контакта
+@dp.message(OrderStates.waiting_contacts)
+async def debug_contact_handler(message: types.Message, state: FSMContext):
+    logger.info(f"🔍 ОТЛАДКА: Получено сообщение в состоянии waiting_contacts: {message.text}")
+    logger.info(f"🔍 ОТЛАДКА: Тип сообщения: {message.content_type}")
+    logger.info(f"🔍 ОТЛАДКА: Есть контакт: {message.contact is not None}")
+    
+    if message.contact:
+        logger.info(f"🔍 ОТЛАДКА: Данные контакта: {message.contact.phone_number}")
+    else:
+        await message.answer("❌ Пожалуйста, нажмите кнопку '📞 Оставить контакты' для отправки телефона")
+
+# ОБРАБОТЧИК КОНТАКТОВ (УПРОЩЕННЫЙ И ИСПРАВЛЕННЫЙ)
 @dp.message(OrderStates.waiting_contacts, F.contact)
 async def contact_handler(message: types.Message, state: FSMContext):
-    phone = message.contact.phone_number
-    logger.info(f"📞 Получен контакт: {phone}")
-    
-    # Сохраняем контакт
-    async with AsyncSessionLocal() as session:
-        user = await session.get(User, message.from_user.id)
-        user.phone = phone
-        await session.commit()
-    
-    await message.answer(
-        f"✅ Телефон сохранен: {phone}\n\n"
-        "Теперь выберите ваш часовой пояс:",
-        reply_markup=ReplyKeyboardMarkup(
+    try:
+        phone = message.contact.phone_number
+        logger.info(f"📞 Получен контакт: {phone} от пользователя {message.from_user.id}")
+        
+        # Сохраняем контакт
+        async with AsyncSessionLocal() as session:
+            user = await session.get(User, message.from_user.id)
+            if user:
+                user.phone = phone
+                await session.commit()
+                logger.info(f"✅ Телефон сохранен для пользователя {user.first_name}")
+            else:
+                logger.error(f"❌ Пользователь {message.from_user.id} не найден при сохранении телефона")
+                await message.answer("❌ Ошибка: пользователь не найден")
+                return
+        
+        # Создаем клавиатуру для выбора часового пояса
+        timezone_keyboard = ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="Москва (+3)"), KeyboardButton(text="Калининград (+2)")],
                 [KeyboardButton(text="Екатеринбург (+5)"), KeyboardButton(text="Определить по городу")]
             ],
             resize_keyboard=True
         )
-    )
-    
-    await state.set_state(OrderStates.waiting_timezone)
+        
+        await message.answer(
+            f"✅ Телефон сохранен: {phone}\n\n"
+            "Теперь выберите ваш часовой пояс:",
+            reply_markup=timezone_keyboard
+        )
+        
+        # Переходим к следующему состоянию
+        await state.set_state(OrderStates.waiting_timezone)
+        logger.info(f"✅ Переход к состоянию waiting_timezone для пользователя {message.from_user.id}")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при обработке контакта: {e}")
+        await message.answer("❌ Произошла ошибка при сохранении контакта")
 
-# ОБРАБОТЧИК ЧАСОВОГО ПОЯСА
+# ОТЛАДОЧНЫЙ ОБРАБОТЧИК для часового пояса
 @dp.message(OrderStates.waiting_timezone)
-async def timezone_handler(message: types.Message, state: FSMContext):
+async def debug_timezone_handler(message: types.Message, state: FSMContext):
+    logger.info(f"🔍 ОТЛАДКА: Получено сообщение в состоянии waiting_timezone: {message.text}")
+    
     timezone_map = {
         "Москва (+3)": "Europe/Moscow",
         "Калининград (+2)": "Europe/Kaliningrad", 
-        "Екатеринбург (+5)": "Asia/Yekaterinburg"
+        "Екатеринбург (+5)": "Asia/Yekaterinburg",
+        "Определить по городу": "auto"
     }
     
     if message.text in timezone_map:
         timezone = timezone_map[message.text]
+        logger.info(f"🔍 ОТЛАДКА: Выбран часовой пояс: {timezone}")
         
         # Сохраняем часовой пояс
         async with AsyncSessionLocal() as session:
             user = await session.get(User, message.from_user.id)
-            user.timezone = timezone
-            await session.commit()
+            if user:
+                user.timezone = timezone
+                if message.text == "Определить по городу":
+                    user.city = "auto"
+                await session.commit()
+                logger.info(f"✅ Часовой пояс сохранен для пользователя {user.first_name}")
+            else:
+                logger.error(f"❌ Пользователь не найден при сохранении часового пояса")
         
-        await message.answer(
-            f"✅ Часовой пояс сохранен: {message.text}\n\n"
-            "🎊 Поздравляем с покупкой! Ваш набор будет отправлен в ближайшее время.\n\n"
-            "Менеджер свяжется с вами для уточнения деталей доставки.",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[
-                    [KeyboardButton(text="🧪 Начать тест")],
-                    [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📦 Статус заказа")]
-                ],
-                resize_keyboard=True
-            )
+        # Главное меню после успешного завершения
+        main_keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="🧪 Начать тест")],
+                [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📦 Статус заказа")]
+            ],
+            resize_keyboard=True
         )
         
+        success_message = f"✅ Часовой пояс сохранен: {message.text}\n\n"
+        if message.text == "Определить по городу":
+            success_message += "📍 Мы определим ваш часовой пояс автоматически по городу.\n\n"
+        
+        success_message += "🎊 Поздравляем с покупкой! Ваш набор будет отправлен в ближайшее время.\n\nМенеджер свяжется с вами для уточнения деталей доставки."
+        
+        await message.answer(success_message, reply_markup=main_keyboard)
+        
+        # Очищаем состояние
         await state.clear()
+        logger.info(f"✅ Состояние очищено для пользователя {message.from_user.id}")
+        
     else:
-        await message.answer("❌ Пожалуйста, выберите часовой пояс из предложенных вариантов")
+        logger.warning(f"🔍 ОТЛАДКА: Неизвестный часовой пояс: {message.text}")
+        await message.answer(
+            "❌ Пожалуйста, выберите часовой пояс из предложенных вариантов:\n"
+            "• Москва (+3)\n"
+            "• Калининград (+2)\n" 
+            "• Екатеринбург (+5)\n"
+            "• Определить по городу"
+        )
 
 # ОБРАБОТЧИК ПРОФИЛЯ
 @dp.message(Command("profile"))
