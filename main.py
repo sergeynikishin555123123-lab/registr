@@ -8,7 +8,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import Column, Integer, String, BigInteger, DateTime, Text, Float, Boolean
+from sqlalchemy import Column, Integer, String, BigInteger, DateTime, Text, Float, Boolean, select
 from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime
 import uuid
@@ -58,20 +58,6 @@ class Order(Base):
     transaction_id = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-class ReferralLink(Base):
-    __tablename__ = "referral_links"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), unique=True)
-    scenario = Column(String(50))
-    created_by = Column(Integer)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    is_active = Column(Boolean, default=True)
-
-# Состояния для FSM
-class OrderStates(StatesGroup):
-    waiting_contacts = State()
-    waiting_timezone = State()
-
 # Подключение к PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL").replace("postgresql://", "postgresql+asyncpg://")
 engine = create_async_engine(DATABASE_URL, echo=True)
@@ -83,12 +69,16 @@ async def create_tables():
         await conn.run_sync(Base.metadata.create_all)
     logger.info("✅ Таблицы базы данных созданы")
 
+async def get_user(tg_id: int):
+    """Получаем пользователя из БД"""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(User).where(User.tg_id == tg_id))
+        return result.scalar_one_or_none()
+
 async def get_or_create_user(tg_id: int, username: str, first_name: str, source: str = 'direct'):
     """Получаем или создаем пользователя"""
     async with AsyncSessionLocal() as session:
-        from sqlalchemy import select
-        result = await session.execute(select(User).where(User.tg_id == tg_id))
-        user = result.scalar_one_or_none()
+        user = await get_user(tg_id)
         
         if not user:
             user = User(
@@ -133,7 +123,12 @@ async def create_order(user_id: int, amount: float):
         logger.info(f"💰 Создан заказ #{order.id} для пользователя {user_id}")
         return order
 
-# ОБРАБОТЧИК /start С РЕФЕРАЛЬНЫМИ ССЫЛКАМИ
+# Состояния для FSM
+class OrderStates(StatesGroup):
+    waiting_contacts = State()
+    waiting_timezone = State()
+
+# ОБРАБОТЧИК /start
 @dp.message(CommandStart())
 async def start_command(message: types.Message):
     logger.info(f"📥 Получен /start от {message.from_user.id}")
@@ -187,7 +182,8 @@ async def start_command(message: types.Message):
 # ОБРАБОТЧИК РЕФЕРАЛЬНОЙ ССЫЛКИ
 @dp.message(F.text == "🔗 Моя реф ссылка")
 async def my_referral_handler(message: types.Message):
-    referral_link = f"https://t.me/{(await bot.get_me()).username}?start=ref_{message.from_user.id}"
+    bot_username = (await bot.get_me()).username
+    referral_link = f"https://t.me/{bot_username}?start=ref_{message.from_user.id}"
     
     await message.answer(
         f"🔗 Ваша реферальная ссылка:\n\n"
@@ -200,13 +196,13 @@ async def my_referral_handler(message: types.Message):
 @dp.message(F.text == "💰 Оплатить анализ")
 async def payment_handler(message: types.Message, state: FSMContext):
     # Создаем заказ
-    order = await create_order(message.from_user.id, 2990.00)  # 2990 руб
+    order = await create_order(message.from_user.id, 2990.00)
     
     # Инлайн-клавиатура для оплаты
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить 2990 руб", url="https://yookassa.ru/test-payment")],
-            [InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data=f"paid_{order.id}")]
+            [InlineKeyboardButton(text="💳 Оплатить 2990 руб", url="https://example.com/payment")],
+            [InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data=f"paid:{order.id}")]
         ]
     )
     
@@ -221,50 +217,63 @@ async def payment_handler(message: types.Message, state: FSMContext):
         reply_markup=keyboard
     )
 
-# ОБРАБОТЧИК ПОДТВЕРЖДЕНИЯ ОПЛАТЫ
-@dp.callback_query(F.data.startswith("paid_"))
+# ОБРАБОТЧИК ПОДТВЕРЖДЕНИЯ ОПЛАТЫ (ИСПРАВЛЕННЫЙ)
+@dp.callback_query(F.data.startswith("paid:"))
 async def payment_confirmation_handler(callback: types.CallbackQuery, state: FSMContext):
-    order_id = int(callback.data.split("_")[1])
-    
-    # Обновляем статус заказа
-    async with AsyncSessionLocal() as session:
-        order = await session.get(Order, order_id)
-        if order:
-            order.payment_status = 'paid'
-            order.payment_date = datetime.utcnow()
-            order.transaction_id = str(uuid.uuid4())
-            await session.commit()
-            
-            # Обновляем статус пользователя
-            user = await session.get(User, order.user_id)
-            user.status = 'paid'
-            await session.commit()
-    
-    await callback.message.answer(
-        "🎉 Оплата подтверждена! Спасибо за заказ!\n\n"
-        "Теперь нам нужны ваши контактные данные для доставки набора.",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="📞 Оставить контакты", request_contact=True)]
-            ],
-            resize_keyboard=True
-        )
-    )
-    
-    await state.set_state(OrderStates.waiting_contacts)
-    await callback.answer()
+    try:
+        order_id = int(callback.data.split(":")[1])
+        logger.info(f"💰 Подтверждение оплаты для заказа #{order_id}")
+        
+        # Обновляем статус заказа
+        async with AsyncSessionLocal() as session:
+            order = await session.get(Order, order_id)
+            if order:
+                order.payment_status = 'paid'
+                order.payment_date = datetime.utcnow()
+                order.transaction_id = str(uuid.uuid4())[:8]
+                await session.commit()
+                
+                # Обновляем статус пользователя
+                user = await session.get(User, order.user_id)
+                user.status = 'paid'
+                await session.commit()
+                
+                logger.info(f"✅ Оплата подтверждена для заказа #{order_id}")
+                
+                await callback.message.answer(
+                    "🎉 Оплата подтверждена! Спасибо за заказ!\n\n"
+                    "Теперь нам нужны ваши контактные данные для доставки набора.",
+                    reply_markup=ReplyKeyboardMarkup(
+                        keyboard=[
+                            [KeyboardButton(text="📞 Оставить контакты", request_contact=True)]
+                        ],
+                        resize_keyboard=True
+                    )
+                )
+                
+                await state.set_state(OrderStates.waiting_contacts)
+                await callback.answer("✅ Оплата подтверждена!")
+            else:
+                await callback.answer("❌ Заказ не найден")
+                
+    except Exception as e:
+        logger.error(f"❌ Ошибка при подтверждении оплаты: {e}")
+        await callback.answer("❌ Произошла ошибка")
 
 # ОБРАБОТЧИК КОНТАКТОВ
 @dp.message(OrderStates.waiting_contacts, F.contact)
 async def contact_handler(message: types.Message, state: FSMContext):
+    phone = message.contact.phone_number
+    logger.info(f"📞 Получен контакт: {phone}")
+    
     # Сохраняем контакт
     async with AsyncSessionLocal() as session:
         user = await session.get(User, message.from_user.id)
-        user.phone = message.contact.phone_number
+        user.phone = phone
         await session.commit()
     
     await message.answer(
-        "✅ Телефон сохранен!\n\n"
+        f"✅ Телефон сохранен: {phone}\n\n"
         "Теперь выберите ваш часовой пояс:",
         reply_markup=ReplyKeyboardMarkup(
             keyboard=[
@@ -278,7 +287,7 @@ async def contact_handler(message: types.Message, state: FSMContext):
     await state.set_state(OrderStates.waiting_timezone)
 
 # ОБРАБОТЧИК ЧАСОВОГО ПОЯСА
-@dp.message(OrderStates.waiting_timezone, F.text.in_(["Москва (+3)", "Калининград (+2)", "Екатеринбург (+5)"]))
+@dp.message(OrderStates.waiting_timezone)
 async def timezone_handler(message: types.Message, state: FSMContext):
     timezone_map = {
         "Москва (+3)": "Europe/Moscow",
@@ -286,36 +295,87 @@ async def timezone_handler(message: types.Message, state: FSMContext):
         "Екатеринбург (+5)": "Asia/Yekaterinburg"
     }
     
-    timezone = timezone_map[message.text]
-    
-    # Сохраняем часовой пояс
-    async with AsyncSessionLocal() as session:
-        user = await session.get(User, message.from_user.id)
-        user.timezone = timezone
-        await session.commit()
-    
-    await message.answer(
-        f"✅ Часовой пояс сохранен: {message.text}\n\n"
-        "🎊 Поздравляем с покупкой! Ваш набор будет отправлен в ближайшее время.\n\n"
-        "Менеджер свяжется с вами для уточнения деталей доставки.",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🧪 Начать тест")],
-                [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📦 Статус заказа")]
-            ],
-            resize_keyboard=True
+    if message.text in timezone_map:
+        timezone = timezone_map[message.text]
+        
+        # Сохраняем часовой пояс
+        async with AsyncSessionLocal() as session:
+            user = await session.get(User, message.from_user.id)
+            user.timezone = timezone
+            await session.commit()
+        
+        await message.answer(
+            f"✅ Часовой пояс сохранен: {message.text}\n\n"
+            "🎊 Поздравляем с покупкой! Ваш набор будет отправлен в ближайшее время.\n\n"
+            "Менеджер свяжется с вами для уточнения деталей доставки.",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text="🧪 Начать тест")],
+                    [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📦 Статус заказа")]
+                ],
+                resize_keyboard=True
+            )
         )
-    )
+        
+        await state.clear()
+    else:
+        await message.answer("❌ Пожалуйста, выберите часовой пояс из предложенных вариантов")
+
+# ОБРАБОТЧИК ПРОФИЛЯ (ИСПРАВЛЕННЫЙ)
+@dp.message(Command("profile"))
+@dp.message(F.text == "👤 Профиль")
+async def profile_command(message: types.Message):
+    logger.info(f"📊 Запрос профиля от {message.from_user.id}")
     
-    await state.clear()
+    user = await get_user(message.from_user.id)
+    
+    if user:
+        # Получаем последний заказ
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Order).where(Order.user_id == user.id).order_by(Order.created_at.desc())
+            )
+            order = result.scalar_one_or_none()
+        
+        profile_text = (
+            f"👤 Ваш профиль:\n"
+            f"Имя: {user.first_name or 'Не указано'}\n"
+            f"Username: @{user.username or 'Не указан'}\n"
+            f"Телефон: {user.phone or 'Не указан'}\n"
+            f"Часовой пояс: {user.timezone or 'Не указан'}\n"
+            f"Статус: {user.status}\n"
+            f"Источник: {user.source or 'Не указан'}\n"
+            f"Сценарий: {user.scenario}\n"
+            f"Зарегистрирован: {user.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+        )
+        
+        if order:
+            status_text = {
+                'new': '🆕 Новый',
+                'pending': '⏳ Ожидает оплаты', 
+                'paid': '✅ Оплачен',
+                'shipped': '🚚 Отправлен',
+                'delivered': '📦 Доставлен'
+            }
+            profile_text += f"Последний заказ: #{order.id} ({status_text.get(order.payment_status, order.payment_status)})"
+        
+    else:
+        profile_text = "❌ Профиль не найден. Напишите /start"
+    
+    await message.answer(profile_text)
 
 # ОБРАБОТЧИК СТАТУСА ЗАКАЗА
 @dp.message(F.text == "📦 Статус заказа")
 async def order_status_handler(message: types.Message):
+    user = await get_user(message.from_user.id)
+    
+    if not user:
+        await message.answer("❌ Сначала напишите /start")
+        return
+        
     async with AsyncSessionLocal() as session:
-        from sqlalchemy import select
         result = await session.execute(
-            select(Order).where(Order.user_id == message.from_user.id).order_by(Order.created_at.desc())
+            select(Order).where(Order.user_id == user.id).order_by(Order.created_at.desc())
         )
         order = result.scalar_one_or_none()
         
@@ -337,58 +397,7 @@ async def order_status_handler(message: types.Message):
         else:
             await message.answer("❌ У вас нет заказов")
 
-# ОБРАБОТЧИК /profile
-@dp.message(Command("profile"))
-@dp.message(F.text == "👤 Профиль")
-async def profile_command(message: types.Message):
-    async with AsyncSessionLocal() as session:
-        from sqlalchemy import select
-        result = await session.execute(select(User).where(User.tg_id == message.from_user.id))
-        user = result.scalar_one_or_none()
-        
-        if user:
-            # Получаем последний заказ
-            order_result = await session.execute(
-                select(Order).where(Order.user_id == message.from_user.id).order_by(Order.created_at.desc())
-            )
-            order = order_result.scalar_one_or_none()
-            
-            profile_text = (
-                f"👤 Ваш профиль:\n"
-                f"Имя: {user.first_name}\n"
-                f"Username: @{user.username}\n"
-                f"Телефон: {user.phone or 'не указан'}\n"
-                f"Часовой пояс: {user.timezone or 'не указан'}\n"
-                f"Статус: {user.status}\n"
-                f"Источник: {user.source or 'не указан'}\n"
-                f"Сценарий: {user.scenario}\n"
-            )
-            
-            if order:
-                profile_text += f"Последний заказ: #{order.id} ({order.payment_status})"
-            
-        else:
-            profile_text = "❌ Профиль не найден. Напишите /start"
-    
-    await message.answer(profile_text)
-
-# ОБРАБОТЧИК АДМИНКИ ДЛЯ СОЗДАНИЯ РЕФЕРАЛЬНЫХ ССЫЛОК
-@dp.message(Command("admin"))
-async def admin_command(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Доступ запрещен")
-        return
-    
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Создать реф ссылку", callback_data="create_ref")],
-            [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")]
-        ]
-    )
-    
-    await message.answer("👨‍💻 Панель администратора", reply_markup=keyboard)
-
-# ОБРАБОТЧИКИ ДЛЯ ТЕСТА (из предыдущей версии)
+# ОБРАБОТЧИКИ ДЛЯ ТЕСТА (оставляем как были)
 @dp.message(F.text == "🧪 Начать тест")
 async def start_test_handler(message: types.Message):
     await message.answer(
@@ -483,7 +492,7 @@ async def echo_handler(message: types.Message):
     )
 
 async def main():
-    logger.info("🚀 Запуск бота GenoLife с оплатой и рефералами...")
+    logger.info("🚀 Запуск бота GenoLife с исправленными обработчиками...")
     
     try:
         await create_tables()
