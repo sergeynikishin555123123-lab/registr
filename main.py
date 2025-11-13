@@ -374,19 +374,7 @@ async def payment_confirmation_handler(callback: types.CallbackQuery, state: FSM
         logger.error(f"❌ Ошибка при подтверждении оплаты: {e}")
         await callback.answer("❌ Произошла ошибка")
 
-# ОТЛАДОЧНЫЙ ОБРАБОТЧИК - что происходит при отправке контакта
-@dp.message(OrderStates.waiting_contacts)
-async def debug_contact_handler(message: types.Message, state: FSMContext):
-    logger.info(f"🔍 ОТЛАДКА: Получено сообщение в состоянии waiting_contacts: {message.text}")
-    logger.info(f"🔍 ОТЛАДКА: Тип сообщения: {message.content_type}")
-    logger.info(f"🔍 ОТЛАДКА: Есть контакт: {message.contact is not None}")
-    
-    if message.contact:
-        logger.info(f"🔍 ОТЛАДКА: Данные контакта: {message.contact.phone_number}")
-    else:
-        await message.answer("❌ Пожалуйста, нажмите кнопку '📞 Оставить контакты' для отправки телефона")
-
-# ОБРАБОТЧИК КОНТАКТОВ (УПРОЩЕННЫЙ И ИСПРАВЛЕННЫЙ)
+# ОБРАБОТЧИК КОНТАКТОВ (ОСНОВНОЙ)
 @dp.message(OrderStates.waiting_contacts, F.contact)
 async def contact_handler(message: types.Message, state: FSMContext):
     try:
@@ -428,10 +416,20 @@ async def contact_handler(message: types.Message, state: FSMContext):
         logger.error(f"❌ Ошибка при обработке контакта: {e}")
         await message.answer("❌ Произошла ошибка при сохранении контакта")
 
-# ОТЛАДОЧНЫЙ ОБРАБОТЧИК для часового пояса
+# ОБРАБОТЧИК ДЛЯ НЕПРАВИЛЬНЫХ СООБЩЕНИЙ В СОСТОЯНИИ waiting_contacts
+@dp.message(OrderStates.waiting_contacts)
+async def wrong_contact_handler(message: types.Message):
+    """Обрабатывает текстовые сообщения когда ожидается контакт"""
+    logger.info(f"⚠️ Получено текстовое сообщение вместо контакта: {message.text}")
+    await message.answer(
+        "❌ Пожалуйста, нажмите кнопку '📞 Оставить контакты' для отправки телефона\n\n"
+        "Это необходимо для доставки набора анализов."
+    )
+
+# ОБРАБОТЧИК ЧАСОВОГО ПОЯСА (ОСНОВНОЙ)
 @dp.message(OrderStates.waiting_timezone)
-async def debug_timezone_handler(message: types.Message, state: FSMContext):
-    logger.info(f"🔍 ОТЛАДКА: Получено сообщение в состоянии waiting_timezone: {message.text}")
+async def timezone_handler(message: types.Message, state: FSMContext):
+    logger.info(f"🕐 Обработка часового пояса: {message.text}")
     
     timezone_map = {
         "Москва (+3)": "Europe/Moscow",
@@ -442,7 +440,7 @@ async def debug_timezone_handler(message: types.Message, state: FSMContext):
     
     if message.text in timezone_map:
         timezone = timezone_map[message.text]
-        logger.info(f"🔍 ОТЛАДКА: Выбран часовой пояс: {timezone}")
+        logger.info(f"✅ Выбран часовой пояс: {timezone}")
         
         # Сохраняем часовой пояс
         async with AsyncSessionLocal() as session:
@@ -478,7 +476,7 @@ async def debug_timezone_handler(message: types.Message, state: FSMContext):
         logger.info(f"✅ Состояние очищено для пользователя {message.from_user.id}")
         
     else:
-        logger.warning(f"🔍 ОТЛАДКА: Неизвестный часовой пояс: {message.text}")
+        logger.warning(f"⚠️ Неизвестный часовой пояс: {message.text}")
         await message.answer(
             "❌ Пожалуйста, выберите часовой пояс из предложенных вариантов:\n"
             "• Москва (+3)\n"
