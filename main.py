@@ -147,114 +147,74 @@ async def save_quiz_answer(user_id: int, question_id: str, answer: str):
 async def create_order(user_id: int, amount: float):
     """Создает заказ"""
     async with AsyncSessionLocal() as session:
+        # Находим пользователя по tg_id чтобы получить его id в БД
+        user_result = await session.execute(select(User).where(User.tg_id == user_id))
+        user = user_result.scalar_one_or_none()
+        
+        if not user:
+            logger.error(f"❌ Пользователь с tg_id {user_id} не найден при создании заказа")
+            return None
+            
         order = Order(
-            user_id=user_id,
+            user_id=user.id,  # Сохраняем id пользователя из БД, а не tg_id
             amount=amount,
             payment_status='pending'
         )
         session.add(order)
         await session.commit()
         await session.refresh(order)
-        logger.info(f"💰 Создан заказ #{order.id} для пользователя {user_id}")
+        logger.info(f"💰 Создан заказ #{order.id} для пользователя {user.first_name} (ID: {user.id})")
         return order
 
-# Состояния для FSM
-class OrderStates(StatesGroup):
-    waiting_contacts = State()
-    waiting_timezone = State()
-
-# ОБРАБОТЧИК /start
-@dp.message(CommandStart())
-async def start_command(message: types.Message):
-    logger.info(f"📥 Получен /start от {message.from_user.id}")
-    
-    # Определяем источник и сценарий
-    source = 'direct'
-    scenario = 'default'
-    
-    if len(message.text.split()) > 1:
-        source = message.text.split()[1]
+# ОБРАБОТЧИК ПОДТВЕРЖДЕНИЯ ОПЛАТЫ (ИСПРАВЛЕННЫЙ)
+@dp.callback_query(F.data.startswith("paid:"))
+async def payment_confirmation_handler(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        order_id = int(callback.data.split(":")[1])
+        logger.info(f"💰 Подтверждение оплаты для заказа #{order_id}")
         
-        # Определяем сценарий по источнику
-        if 'blogger1' in source:
-            scenario = 'blogger1'
-            welcome_text = "👋 Привет! Вы пришли от Блоггера 1!\n\nДавайте узнаем больше о вашем здоровье..."
-        elif 'blogger2' in source:
-            scenario = 'blogger2' 
-            welcome_text = "👋 Привет! Вы пришли от Блоггера 2!\n\nНачнем путь к улучшению здоровья!"
-        else:
-            welcome_text = "🎉 Добро пожаловать в GenoLife!\n\nЯ помогу вам пройти анализ и улучшить здоровье."
-    else:
-        welcome_text = "🎉 Добро пожаловать в GenoLife!\n\nЯ помогу вам пройти анализ и улучшить здоровье."
-    
-    # Сохраняем пользователя
-    user = await get_or_create_user(
-        message.from_user.id,
-        message.from_user.username,
-        message.from_user.first_name,
-        source
-    )
-    
-    # Обновляем сценарий (безопасно, так как колонка теперь есть)
-    async with AsyncSessionLocal() as session:
-        db_user = await session.get(User, message.from_user.id)
-        if hasattr(db_user, 'scenario'):
-            db_user.scenario = scenario
-        await session.commit()
-    
-    # Клавиатура
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🧪 Начать тест")],
-            [KeyboardButton(text="💰 Оплатить анализ"), KeyboardButton(text="👤 Профиль")],
-            [KeyboardButton(text="🔗 Моя реф ссылка"), KeyboardButton(text="ℹ️ О проекте")]
-        ],
-        resize_keyboard=True
-    )
-    
-    await message.answer(welcome_text + "\n\nВыберите действие:", reply_markup=keyboard)
-    logger.info(f"🔗 Пользователь {user.first_name} пришел из: {source}, сценарий: {scenario}")
+        # Обновляем статус заказа
+        async with AsyncSessionLocal() as session:
+            order = await session.get(Order, order_id)
+            if order:
+                order.payment_status = 'paid'
+                order.payment_date = datetime.utcnow()
+                order.transaction_id = str(uuid.uuid4())[:8]
+                await session.commit()
+                
+                # Обновляем статус пользователя (теперь user_id = id пользователя в БД)
+                user = await session.get(User, order.user_id)
+                
+                if user:
+                    user.status = 'paid'
+                    await session.commit()
+                    
+                    logger.info(f"✅ Оплата подтверждена для заказа #{order_id}, пользователь {user.first_name}")
+                    
+                    await callback.message.answer(
+                        "🎉 Оплата подтверждена! Спасибо за заказ!\n\n"
+                        "Теперь нам нужны ваши контактные данные для доставки набора.",
+                        reply_markup=ReplyKeyboardMarkup(
+                            keyboard=[
+                                [KeyboardButton(text="📞 Оставить контакты", request_contact=True)]
+                            ],
+                            resize_keyboard=True
+                        )
+                    )
+                    
+                    await state.set_state(OrderStates.waiting_contacts)
+                    await callback.answer("✅ Оплата подтверждена!")
+                else:
+                    logger.error(f"❌ Пользователь не найден для заказа #{order_id}")
+                    await callback.answer("❌ Ошибка: пользователь не найден")
+            else:
+                await callback.answer("❌ Заказ не найден")
+                
+    except Exception as e:
+        logger.error(f"❌ Ошибка при подтверждении оплаты: {e}")
+        await callback.answer("❌ Произошла ошибка")
 
-# ОБРАБОТЧИК РЕФЕРАЛЬНОЙ ССЫЛКИ
-@dp.message(F.text == "🔗 Моя реф ссылка")
-async def my_referral_handler(message: types.Message):
-    bot_username = (await bot.get_me()).username
-    referral_link = f"https://t.me/{bot_username}?start=ref_{message.from_user.id}"
-    
-    await message.answer(
-        f"🔗 Ваша реферальная ссылка:\n\n"
-        f"`{referral_link}`\n\n"
-        f"Поделитесь этой ссылкой с друзьями!",
-        parse_mode="Markdown"
-    )
-
-# ОБРАБОТЧИК ОПЛАТЫ
-@dp.message(F.text == "💰 Оплатить анализ")
-async def payment_handler(message: types.Message, state: FSMContext):
-    # Создаем заказ
-    order = await create_order(message.from_user.id, 2990.00)
-    
-    # ТЕСТОВАЯ оплата - сразу переходим к подтверждению
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Тестовая оплата", callback_data=f"test_payment:{order.id}")],
-            [InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data=f"paid:{order.id}")]
-        ]
-    )
-    
-    await message.answer(
-        "💰 Оплата анализа\n\n"
-        "Стоимость полного анализа: 2 990 руб.\n\n"
-        "Включает:\n"
-        "• Комплект для сбора анализов\n"
-        "• Подробный отчет\n"
-        "• Персональные рекомендации\n\n"
-        "💡 *Для теста:* нажмите 'Тестовая оплата' или 'Я оплатил(а)'",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
-
-# ТЕСТОВАЯ ОПЛАТА (имитация)
+# ТЕСТОВАЯ ОПЛАТА (исправленная)
 @dp.callback_query(F.data.startswith("test_payment:"))
 async def test_payment_handler(callback: types.CallbackQuery, state: FSMContext):
     try:
@@ -271,8 +231,7 @@ async def test_payment_handler(callback: types.CallbackQuery, state: FSMContext)
                 await session.commit()
                 
                 # Обновляем статус пользователя
-                user_result = await session.execute(select(User).where(User.id == order.user_id))
-                user = user_result.scalar_one_or_none()
+                user = await session.get(User, order.user_id)
                 
                 if user:
                     user.status = 'paid'
