@@ -11,6 +11,14 @@ logger = logging.getLogger(__name__)
 class ManagerBot:
     def __init__(self, bot: Bot):
         self.bot = bot
+        self._check_config()
+
+    def _check_config(self):
+        """Проверяет конфигурацию менеджерского бота"""
+        if not config.MANAGER_GROUP_ID:
+            logger.warning("⚠️ MANAGER_GROUP_ID не настроен! Все уведомления будут отправляться админу.")
+        else:
+            logger.info(f"✅ MANAGER_GROUP_ID настроен: {config.MANAGER_GROUP_ID}")
 
     async def notify_managers(self, message: str, parse_mode="Markdown"):
         """Отправляет уведомление менеджерам"""
@@ -18,20 +26,21 @@ class ManagerBot:
             logger.info(f"📢 Отправка уведомления менеджерам: {message[:100]}...")
             
             if config.MANAGER_GROUP_ID:
+                # Отправляем в группу менеджеров
                 await self.bot.send_message(
                     chat_id=config.MANAGER_GROUP_ID, 
                     text=message, 
                     parse_mode=parse_mode
                 )
-                logger.info(f"✅ Уведомление отправлено в группу {config.MANAGER_GROUP_ID}")
+                logger.info(f"✅ Уведомление отправлено в группу менеджеров {config.MANAGER_GROUP_ID}")
             else:
-                # Если группа не настроена, отправляем админу
+                # Отправляем админу с пометкой
                 await self.bot.send_message(
                     chat_id=config.ADMIN_ID, 
-                    text=f"📢 {message}", 
+                    text=f"👨‍💼 [Менеджер] {message}", 
                     parse_mode=parse_mode
                 )
-                logger.info(f"✅ Уведомление отправлено админу {config.ADMIN_ID}")
+                logger.info(f"✅ Уведомление отправлено админу {config.ADMIN_ID} (группа не настроена)")
                 
         except Exception as e:
             logger.error(f"❌ Ошибка отправки уведомления менеджерам: {e}")
@@ -75,24 +84,28 @@ class ManagerBot:
                         reply_markup=keyboard,
                         parse_mode="Markdown"
                     )
-                    logger.info(f"✅ Карточка клиента {user_id} отправлена в группу")
+                    logger.info(f"✅ Карточка клиента {user_id} отправлена в группу менеджеров")
                 else:
                     await self.bot.send_message(
                         chat_id=config.ADMIN_ID,
-                        text=card_text,
+                        text=f"👨‍💼 [Карточка клиента]\n\n{card_text}",
                         reply_markup=keyboard,
                         parse_mode="Markdown"
                     )
-                    logger.info(f"✅ Карточка клиента {user_id} отправлена админу")
+                    logger.info(f"✅ Карточка клиента {user_id} отправлена админу (группа не настроена)")
 
         except Exception as e:
             logger.error(f"❌ Ошибка отправки карточки клиента: {e}")
 
     def _format_user_card(self, user: User, orders: List[Order], quiz_data: List) -> str:
         """Форматирует карточку клиента"""
-        # Основная информация
-        card_text = (
-            f"👤 *Карточка клиента*\n\n"
+        # Добавляем пометку для группы менеджеров
+        if config.MANAGER_GROUP_ID:
+            card_text = "👤 *Карточка клиента*\n\n"
+        else:
+            card_text = "👤 *Карточка клиента* (отправлено админу, т.к. группа не настроена)\n\n"
+            
+        card_text += (
             f"*ID:* {user.id}\n"
             f"*Telegram ID:* {user.tg_id}\n"
             f"*Имя:* {user.first_name or 'Не указано'}\n"
@@ -109,7 +122,7 @@ class ManagerBot:
         # Добавляем информацию о заказах
         if orders:
             card_text += f"\n*📦 Заказы ({len(orders)}):*\n"
-            for order in orders[:3]:  # Показываем последние 3 заказа
+            for order in orders[:3]:
                 status_map = {
                     'new': '🆕 Новый',
                     'pending': '⏳ Ожидает оплаты',
@@ -119,16 +132,13 @@ class ManagerBot:
                 }
                 status = status_map.get(order.payment_status, order.payment_status)
                 card_text += f"• *#{order.id}:* {status} - {order.amount} руб\n"
-                if order.created_at:
-                    card_text += f"  *Дата:* {order.created_at.strftime('%d.%m.%Y %H:%M')}\n"
         else:
             card_text += f"\n*📦 Заказы:* Нет заказов\n"
 
         # Добавляем ответы квиза
         if quiz_data:
             card_text += f"\n*🧪 Ответы квиза ({len(quiz_data)}):*\n"
-            for question_id, answer in quiz_data[:5]:  # Показываем первые 5 ответов
-                # Упрощаем отображение вопросов
+            for question_id, answer in quiz_data[:5]:
                 question_name = question_id.replace('_', ' ').title()
                 card_text += f"• *{question_name}:* {answer}\n"
         else:
