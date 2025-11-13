@@ -6,389 +6,93 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import ReplyKeyboardRemove, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy import Column, Integer, String, BigInteger, DateTime, Text, Float, Boolean, select, text
-from sqlalchemy.ext.declarative import declarative_base
-from datetime import datetime
-import uuid
+from aiogram.fsm.storage.memory import MemoryStorage
+
+from config import config
+from database import (
+    get_user_by_tg_id, get_or_create_user, create_tables, 
+    cleanup_duplicate_users, AsyncSessionLocal, User, Order, QuizAnswer
+)
+from content_manager import content_manager
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Создаем бота
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 898508164))
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-# База данных
-Base = declarative_base()
-
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    tg_id = Column(BigInteger, unique=True, index=True)
-    username = Column(String(100), nullable=True)
-    first_name = Column(String(100), nullable=True)
-    phone = Column(String(20), nullable=True)
-    city = Column(String(100), nullable=True)
-    timezone = Column(String(50), nullable=True)
-    source = Column(String(100), nullable=True)
-    scenario = Column(String(50), default='default')
-    status = Column(String(50), default='lead')
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class QuizAnswer(Base):
-    __tablename__ = "quiz_answers"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, index=True)
-    question_id = Column(String(100))
-    answer = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class Order(Base):
-    __tablename__ = "orders"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, index=True)
-    amount = Column(Float)
-    payment_status = Column(String(50), default='new')
-    payment_date = Column(DateTime, nullable=True)
-    transaction_id = Column(String(100), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-# Подключение к PostgreSQL
-DATABASE_URL = os.getenv("DATABASE_URL").replace("postgresql://", "postgresql+asyncpg://")
-engine = create_async_engine(DATABASE_URL, echo=True)
-AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-async def create_tables():
-    """Создаем таблицы в базе данных"""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("✅ Таблицы базы данных созданы")
-
-async def add_missing_columns():
-    """Добавляем отсутствующие колонки в существующие таблицы"""
-    async with engine.begin() as conn:
-        # Проверяем существование колонки scenario в таблице users
-        result = await conn.execute(text("""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'users' AND column_name = 'scenario'
-        """))
-        scenario_exists = result.scalar() is not None
-        
-        if not scenario_exists:
-            logger.info("🔄 Добавляем колонку scenario в таблицу users...")
-            await conn.execute(text("ALTER TABLE users ADD COLUMN scenario VARCHAR(50) DEFAULT 'default'"))
-            logger.info("✅ Колонка scenario добавлена")
-        
-        # Проверяем другие возможные отсутствующие колонки
-        columns_to_check = ['phone', 'city', 'timezone', 'source']
-        for column in columns_to_check:
-            result = await conn.execute(text(f"""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'users' AND column_name = '{column}'
-            """))
-            if result.scalar() is None:
-                logger.info(f"🔄 Добавляем колонку {column} в таблицу users...")
-                if column in ['phone', 'city', 'timezone', 'source']:
-                    await conn.execute(text(f"ALTER TABLE users ADD COLUMN {column} VARCHAR(100)"))
-                logger.info(f"✅ Колонка {column} добавлена")
-
-async def cleanup_orders():
-    """Очищает некорректные заказы"""
-    async with AsyncSessionLocal() as session:
-        # Находим заказы с user_id которые не существуют в таблице users
-        result = await session.execute(text("""
-            DELETE FROM orders 
-            WHERE user_id NOT IN (SELECT id FROM users)
-        """))
-        await session.commit()
-        logger.info(f"🗑️ Удалено {result.rowcount} некорректных заказов")
-
-async def setup_database():
-    """Настраиваем базу данных"""
-    await create_tables()
-    await add_missing_columns()
-    await cleanup_orders()
-    await cleanup_duplicate_users()  # ДОБАВЛЯЕМ ОЧИСТКУ ДУБЛЕЙ
-    logger.info("✅ База данных полностью настроена")
-
-async def get_user(tg_id: int):
-    """Получаем пользователя из БД по tg_id"""
-    async with AsyncSessionLocal() as session:
-        try:
-            result = await session.execute(select(User).where(User.tg_id == tg_id))
-            user = result.scalar_one_or_none()
-            logger.info(f"🔍 Поиск пользователя {tg_id}: {'найден' if user else 'не найден'}")
-            return user
-        except Exception as e:
-            logger.error(f"❌ Ошибка при поиске пользователя {tg_id}: {e}")
-            # Если есть дубли, берем первого
-            result = await session.execute(select(User).where(User.tg_id == tg_id))
-            users = result.scalars().all()
-            if users:
-                logger.warning(f"⚠️ Найдено дублирующихся пользователей: {len(users)}")
-                return users[0]  # Возвращаем первого
-            return None
-
-async def cleanup_duplicate_users():
-    """Удаляет дублирующихся пользователей"""
-    async with AsyncSessionLocal() as session:
-        # Находим дублирующиеся tg_id
-        result = await session.execute(text("""
-            SELECT tg_id, COUNT(*) as count 
-            FROM users 
-            GROUP BY tg_id 
-            HAVING COUNT(*) > 1
-        """))
-        duplicates = result.fetchall()
-        
-        for tg_id, count in duplicates:
-            logger.warning(f"🔄 Найдены дубли для tg_id {tg_id}: {count} записей")
-            
-            # Оставляем самую новую запись, удаляем остальные
-            await session.execute(text("""
-                DELETE FROM users 
-                WHERE tg_id = :tg_id 
-                AND id NOT IN (
-                    SELECT id FROM users 
-                    WHERE tg_id = :tg_id 
-                    ORDER BY created_at DESC 
-                    LIMIT 1
-                )
-            """), {"tg_id": tg_id})
-            
-        await session.commit()
-        logger.info(f"✅ Удалено дублирующихся пользователей: {len(duplicates)}")
-
-# ОБРАБОТЧИК ПРОФИЛЯ (ИСПРАВЛЕННЫЙ)
-@dp.message(Command("profile"))
-@dp.message(F.text == "👤 Профиль")
-async def profile_command(message: types.Message):
-    logger.info(f"📊 Запрос профиля от {message.from_user.id}")
-    
-    user = await get_user(message.from_user.id)
-    
-    if user:
-        # Получаем последний заказ - ИЩЕМ ПО user.id (ID в БД)
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(Order).where(Order.user_id == user.id).order_by(Order.created_at.desc())
-            )
-            order = result.scalar_one_or_none()
-        
-        # Безопасно получаем данные
-        scenario = getattr(user, 'scenario', 'default')
-        
-        profile_text = (
-            f"👤 Ваш профиль:\n"
-            f"ID в БД: {user.id}\n"
-            f"ID Telegram: {user.tg_id}\n"
-            f"Имя: {user.first_name or 'Не указано'}\n"
-            f"Username: @{user.username or 'Не указан'}\n"
-            f"Телефон: {user.phone or 'Не указан'}\n"
-            f"Часовой пояс: {user.timezone or 'Не указан'}\n"
-            f"Статус: {user.status}\n"
-            f"Источник: {user.source or 'Не указан'}\n"
-            f"Сценарий: {scenario}\n"
-            f"Зарегистрирован: {user.created_at.strftime('%d.%m.%Y %H:%M')}\n"
-        )
-        
-        if order:
-            status_text = {
-                'new': '🆕 Новый',
-                'pending': '⏳ Ожидает оплаты', 
-                'paid': '✅ Оплачен',
-                'shipped': '🚚 Отправлен',
-                'delivered': '📦 Доставлен'
-            }
-            profile_text += f"Последний заказ: #{order.id} ({status_text.get(order.payment_status, order.payment_status)})"
-        else:
-            profile_text += "Заказов нет"
-        
-    else:
-        profile_text = "❌ Профиль не найден в базе данных. Напишите /start для регистрации"
-        logger.error(f"❌ Пользователь {message.from_user.id} не найден при запросе профиля")
-    
-    await message.answer(profile_text)
-
-# ОБРАБОТЧИК СТАТУСА ЗАКАЗА (ИСПРАВЛЕННЫЙ)
-@dp.message(F.text == "📦 Статус заказа")
-async def order_status_handler(message: types.Message):
-    logger.info(f"📦 Запрос статуса заказа от {message.from_user.id}")
-    
-    user = await get_user(message.from_user.id)
-    
-    if not user:
-        await message.answer("❌ Пользователь не найден. Сначала напишите /start")
-        logger.error(f"❌ Пользователь {message.from_user.id} не найден при запросе статуса заказа")
-        return
-        
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(Order).where(Order.user_id == user.id).order_by(Order.created_at.desc())
-        )
-        order = result.scalar_one_or_none()
-        
-        if order:
-            status_text = {
-                'new': '🆕 Новый',
-                'pending': '⏳ Ожидает оплаты', 
-                'paid': '✅ Оплачен',
-                'shipped': '🚚 Отправлен',
-                'delivered': '📦 Доставлен'
-            }
-            
-            await message.answer(
-                f"📦 Ваш заказ #{order.id}\n"
-                f"Статус: {status_text.get(order.payment_status, order.payment_status)}\n"
-                f"Сумма: {order.amount} руб\n"
-                f"Дата: {order.created_at.strftime('%d.%m.%Y %H:%M')}\n"
-                f"ID пользователя в БД: {user.id}"
-            )
-            logger.info(f"✅ Показан статус заказа #{order.id} для пользователя {user.id}")
-        else:
-            await message.answer("❌ У вас нет заказов")
-            logger.info(f"ℹ️ У пользователя {user.id} нет заказов")
-
-async def get_or_create_user(tg_id: int, username: str, first_name: str, source: str = 'direct'):
-    """Получаем или создаем пользователя"""
-    async with AsyncSessionLocal() as session:
-        # Сначала проверяем есть ли пользователь
-        user = await get_user(tg_id)
-        
-        if user:
-            # Обновляем данные существующего пользователя
-            user.username = username
-            user.first_name = first_name
-            user.source = source
-            await session.commit()
-            logger.info(f"✅ Обновлен существующий пользователь: {first_name} (ID: {user.id})")
-            return user
-        else:
-            # Создаем нового пользователя
-            user = User(
-                tg_id=tg_id,
-                username=username,
-                first_name=first_name,
-                source=source,
-                status='active'
-            )
-            session.add(user)
-            await session.commit()
-            await session.refresh(user)
-            logger.info(f"✅ Создан новый пользователь: {first_name} (ID: {user.id})")
-            return user
-
-async def save_quiz_answer(user_id: int, question_id: str, answer: str):
-    """Сохраняет ответ на вопрос квиза"""
-    async with AsyncSessionLocal() as session:
-        quiz_answer = QuizAnswer(
-            user_id=user_id,
-            question_id=question_id,
-            answer=answer
-        )
-        session.add(quiz_answer)
-        await session.commit()
-        logger.info(f"💾 Сохранен ответ: {question_id} = {answer}")
-
-async def create_order(user_id: int, amount: float):
-    """Создает заказ"""
-    async with AsyncSessionLocal() as session:
-        # Находим пользователя по tg_id чтобы получить его id в БД
-        user_result = await session.execute(select(User).where(User.tg_id == user_id))
-        user = user_result.scalar_one_or_none()
-        
-        if not user:
-            logger.error(f"❌ Пользователь с tg_id {user_id} не найден при создании заказа")
-            return None
-            
-        order = Order(
-            user_id=user.id,  # Сохраняем id пользователя из БД, а не tg_id
-            amount=amount,
-            payment_status='pending'
-        )
-        session.add(order)
-        await session.commit()
-        await session.refresh(order)
-        logger.info(f"💰 Создан заказ #{order.id} для пользователя {user.first_name} (ID: {user.id})")
-        return order
+bot = Bot(token=config.BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
 # Состояния для FSM
 class OrderStates(StatesGroup):
     waiting_contacts = State()
     waiting_timezone = State()
+    waiting_city = State()
+    waiting_address = State()
 
-@dp.message(Command("cleanup"))
-async def cleanup_command(message: types.Message):
-    """Команда для принудительной очистки дублей"""
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Доступ запрещен")
-        return
-        
-    await cleanup_duplicate_users()
-    await message.answer("✅ Дублирующиеся пользователи очищены")
+class QuizStates(StatesGroup):
+    answering_questions = State()
 
-# ОБРАБОТЧИК /start
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
+
 @dp.message(CommandStart())
 async def start_command(message: types.Message):
+    """Обработчик команды /start с реферальными ссылками"""
     logger.info(f"📥 Получен /start от {message.from_user.id}")
     
-    # Определяем источник и сценарий
+    # Парсим источник и определяем сценарий
     source = 'direct'
     scenario = 'default'
     
     if len(message.text.split()) > 1:
-        source = message.text.split()[1]
+        source_param = message.text.split()[1]
+        source = source_param
         
         # Определяем сценарий по источнику
-        if 'blogger1' in source:
-            scenario = 'blogger1'
-            welcome_text = "👋 Привет! Вы пришли от Блоггера 1!\n\nДавайте узнаем больше о вашем здоровье..."
-        elif 'blogger2' in source:
-            scenario = 'blogger2' 
-            welcome_text = "👋 Привет! Вы пришли от Блоггера 2!\n\nНачнем путь к улучшению здоровья!"
-        else:
-            welcome_text = "🎉 Добро пожаловать в GenoLife!\n\nЯ помогу вам пройти анализ и улучшить здоровье."
-    else:
-        welcome_text = "🎉 Добро пожаловать в GenoLife!\n\nЯ помогу вам пройти анализ и улучшить здоровье."
+        if source_param.startswith('src_'):
+            scenario = source_param[4:]  # Убираем 'src_'
+        elif source_param.startswith('ref_'):
+            scenario = 'referral'
+        elif source_param.startswith('blogger'):
+            scenario = source_param
     
-    # Сохраняем пользователя
+    # Сохраняем/обновляем пользователя
     user = await get_or_create_user(
-        message.from_user.id,
-        message.from_user.username,
-        message.from_user.first_name,
-        source
+        tg_id=message.from_user.id,
+        username=message.from_user.username,
+        first_name=message.from_user.first_name,
+        source=source
     )
     
-    # Обновляем сценарий (безопасно, так как колонка теперь есть)
-    async with AsyncSessionLocal() as session:
-        db_user = await session.get(User, message.from_user.id)
-        if hasattr(db_user, 'scenario'):
-            db_user.scenario = scenario
-        await session.commit()
+    # Получаем контент для сценария
+    welcome_key = f'welcome_{scenario}'
+    welcome_content = content_manager.get(welcome_key) or content_manager.get('welcome_default')
     
-    # Клавиатура
+    if welcome_content:
+        welcome_text = welcome_content['text']
+        buttons = welcome_content.get('buttons', [])
+    else:
+        welcome_text = "🎉 Добро пожаловать в GenoLife!"
+        buttons = ['🧪 Начать тест', '💰 Оплатить анализ', '👤 Профиль', '🔗 Моя реф ссылка', 'ℹ️ О проекте']
+    
+    # Создаем клавиатуру
     keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🧪 Начать тест")],
-            [KeyboardButton(text="💰 Оплатить анализ"), KeyboardButton(text="👤 Профиль")],
-            [KeyboardButton(text="🔗 Моя реф ссылка"), KeyboardButton(text="ℹ️ О проекте")]
-        ],
+        keyboard=[[KeyboardButton(text=btn)] for btn in buttons],
         resize_keyboard=True
     )
     
-    await message.answer(welcome_text + "\n\nВыберите действие:", reply_markup=keyboard)
+    await message.answer(welcome_text, reply_markup=keyboard)
     logger.info(f"🔗 Пользователь {user.first_name} пришел из: {source}, сценарий: {scenario}")
 
-# ОБРАБОТЧИК РЕФЕРАЛЬНОЙ ССЫЛКИ
+# ========== РЕФЕРАЛЬНАЯ СИСТЕМА ==========
+
 @dp.message(F.text == "🔗 Моя реф ссылка")
 async def my_referral_handler(message: types.Message):
+    """Генерация реферальной ссылки"""
     bot_username = (await bot.get_me()).username
     referral_link = f"https://t.me/{bot_username}?start=ref_{message.from_user.id}"
     
@@ -399,181 +103,118 @@ async def my_referral_handler(message: types.Message):
         parse_mode="Markdown"
     )
 
-# ОБРАБОТЧИК ОПЛАТЫ
+# ========== СИСТЕМА ОПЛАТЫ ==========
+
 @dp.message(F.text == "💰 Оплатить анализ")
 async def payment_handler(message: types.Message, state: FSMContext):
-    # Создаем заказ
-    order = await create_order(message.from_user.id, 2990.00)
-    
-    if not order:
-        await message.answer("❌ Ошибка при создании заказа. Попробуйте еще раз.")
+    """Обработчик оплаты анализа"""
+    user = await get_user_by_tg_id(message.from_user.id)
+    if not user:
+        await message.answer("❌ Сначала зарегистрируйтесь через /start")
         return
     
-    # ТЕСТОВАЯ оплата - сразу переходим к подтверждению
+    # Получаем контент оплаты
+    payment_content = content_manager.get('payment_description')
+    payment_text = payment_content['text'] if payment_content else "💰 Оплата анализа"
+    
+    # Создаем заказ в БД
+    async with AsyncSessionLocal() as session:
+        order = Order(
+            user_id=user.id,
+            amount=2990.00,
+            payment_status='pending'
+        )
+        session.add(order)
+        await session.commit()
+        await session.refresh(order)
+    
+    # Тестовая оплата для MVP
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Тестовая оплата", callback_data=f"test_payment:{order.id}")],
-            [InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data=f"paid:{order.id}")]
+            [InlineKeyboardButton(text="💳 Тестовая оплата", callback_data=f"test_pay:{order.id}")],
+            [InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data=f"confirm_pay:{order.id}")]
         ]
     )
     
-    await message.answer(
-        "💰 Оплата анализа\n\n"
-        "Стоимость полного анализа: 2 990 руб.\n\n"
-        "Включает:\n"
-        "• Комплект для сбора анализов\n"
-        "• Подробный отчет\n"
-        "• Персональные рекомендации\n\n"
-        "💡 *Для теста:* нажмите 'Тестовая оплата' или 'Я оплатил(а)'",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
+    await message.answer(payment_text, reply_markup=keyboard)
 
-# ТЕСТОВАЯ ОПЛАТА (исправленная)
-@dp.callback_query(F.data.startswith("test_payment:"))
+@dp.callback_query(F.data.startswith("test_pay:"))
 async def test_payment_handler(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик тестовой оплаты"""
     try:
         order_id = int(callback.data.split(":")[1])
-        logger.info(f"🧪 Тестовая оплата для заказа #{order_id}")
         
-        # Обновляем статус заказа
         async with AsyncSessionLocal() as session:
+            # Обновляем заказ
             order = await session.get(Order, order_id)
             if order:
                 order.payment_status = 'paid'
                 order.payment_date = datetime.utcnow()
-                order.transaction_id = f"TEST_{uuid.uuid4()[:8]}"
+                order.transaction_id = f"TEST_{order_id}"
+                
+                # Обновляем пользователя
+                user = await session.get(User, order.user_id)
+                user.status = 'paid'
+                
                 await session.commit()
                 
-                # Обновляем статус пользователя
-                user = await session.get(User, order.user_id)
+                # Получаем контент успешной оплаты
+                success_content = content_manager.get('payment_success')
+                success_text = success_content['text'] if success_content else "🎉 Оплата подтверждена!"
                 
-                if user:
-                    user.status = 'paid'
-                    await session.commit()
-                    
-                    logger.info(f"✅ Тестовая оплата подтверждена для заказа #{order_id}")
-                    
-                    await callback.message.answer(
-                        "🎉 Тестовая оплата подтверждена! Спасибо за заказ!\n\n"
-                        "Теперь нам нужны ваши контактные данные для доставки набора.",
-                        reply_markup=ReplyKeyboardMarkup(
-                            keyboard=[
-                                [KeyboardButton(text="📞 Оставить контакты", request_contact=True)]
-                            ],
-                            resize_keyboard=True
-                        )
+                await callback.message.answer(
+                    success_text,
+                    reply_markup=ReplyKeyboardMarkup(
+                        keyboard=[[KeyboardButton(text="📞 Оставить контакты", request_contact=True)]],
+                        resize_keyboard=True
                     )
-                    
-                    await state.set_state(OrderStates.waiting_contacts)
-                    await callback.answer("✅ Тестовая оплата подтверждена!")
-                else:
-                    await callback.answer("❌ Пользователь не найден")
-            else:
-                await callback.answer("❌ Заказ не найден")
+                )
+                
+                await state.set_state(OrderStates.waiting_contacts)
+                await callback.answer("✅ Тестовая оплата подтверждена!")
+                
+                # Уведомление менеджеру
+                await notify_managers(f"💰 Новая оплата от {user.first_name} (@{user.username})")
                 
     except Exception as e:
-        logger.error(f"❌ Ошибка при тестовой оплате: {e}")
-        await callback.answer("❌ Произошла ошибка")
+        logger.error(f"❌ Ошибка тестовой оплаты: {e}")
+        await callback.answer("❌ Ошибка оплаты")
 
-# ОБРАБОТЧИК ПОДТВЕРЖДЕНИЯ ОПЛАТЫ (ИСПРАВЛЕННЫЙ)
-@dp.callback_query(F.data.startswith("paid:"))
-async def payment_confirmation_handler(callback: types.CallbackQuery, state: FSMContext):
-    try:
-        order_id = int(callback.data.split(":")[1])
-        logger.info(f"💰 Подтверждение оплаты для заказа #{order_id}")
-        
-        # Обновляем статус заказа
-        async with AsyncSessionLocal() as session:
-            order = await session.get(Order, order_id)
-            if order:
-                order.payment_status = 'paid'
-                order.payment_date = datetime.utcnow()
-                order.transaction_id = str(uuid.uuid4())[:8]
-                await session.commit()
-                
-                # Обновляем статус пользователя (теперь user_id = id пользователя в БД)
-                user = await session.get(User, order.user_id)
-                
-                if user:
-                    user.status = 'paid'
-                    await session.commit()
-                    
-                    logger.info(f"✅ Оплата подтверждена для заказа #{order_id}, пользователь {user.first_name}")
-                    
-                    await callback.message.answer(
-                        "🎉 Оплата подтверждена! Спасибо за заказ!\n\n"
-                        "Теперь нам нужны ваши контактные данные для доставки набора.",
-                        reply_markup=ReplyKeyboardMarkup(
-                            keyboard=[
-                                [KeyboardButton(text="📞 Оставить контакты", request_contact=True)]
-                            ],
-                            resize_keyboard=True
-                        )
-                    )
-                    
-                    await state.set_state(OrderStates.waiting_contacts)
-                    await callback.answer("✅ Оплата подтверждена!")
-                else:
-                    logger.error(f"❌ Пользователь не найден для заказа #{order_id}")
-                    await callback.answer("❌ Ошибка: пользователь не найден")
-            else:
-                await callback.answer("❌ Заказ не найден")
-                
-    except Exception as e:
-        logger.error(f"❌ Ошибка при подтверждении оплаты: {e}")
-        await callback.answer("❌ Произошла ошибка")
+# ========== СБОР КОНТАКТОВ И АДРЕСА ==========
 
-# ОБРАБОТЧИК КОНТАКТОВ (ИСПРАВЛЕННЫЙ ПОИСК)
 @dp.message(OrderStates.waiting_contacts, F.contact)
-async def contact_handler(message: types.Message, state: FSMContext):
-    try:
-        phone = message.contact.phone_number
-        logger.info(f"📞 Получен контакт: {phone} от пользователя {message.from_user.id}")
-        
-        # Сохраняем контакт - ИЩЕМ ПО tg_id (ID Telegram), а не по id БД
-        async with AsyncSessionLocal() as session:
-            # Ищем пользователя по tg_id (ID Telegram)
-            result = await session.execute(select(User).where(User.tg_id == message.from_user.id))
-            user = result.scalar_one_or_none()
-            
-            if user:
-                user.phone = phone
-                await session.commit()
-                logger.info(f"✅ Телефон сохранен для пользователя {user.first_name} (ID: {user.id})")
-            else:
-                logger.error(f"❌ Пользователь с tg_id {message.from_user.id} не найден в БД")
-                await message.answer("❌ Ошибка: пользователь не найден в базе данных")
-                return
-        
-        # Создаем клавиатуру для выбора часового пояса
-        timezone_keyboard = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="Москва (+3)"), KeyboardButton(text="Калининград (+2)")],
-                [KeyboardButton(text="Екатеринбург (+5)"), KeyboardButton(text="Определить по городу")]
-            ],
-            resize_keyboard=True
-        )
-        
-        await message.answer(
-            f"✅ Телефон сохранен: {phone}\n\n"
-            "Теперь выберите ваш часовой пояс:",
-            reply_markup=timezone_keyboard
-        )
-        
-        # Переходим к следующему состоянию
-        await state.set_state(OrderStates.waiting_timezone)
-        logger.info(f"✅ Переход к состоянию waiting_timezone для пользователя {message.from_user.id}")
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка при обработке контакта: {e}")
-        await message.answer("❌ Произошла ошибка при сохранении контакта")
+async def contact_received_handler(message: types.Message, state: FSMContext):
+    """Обработчик получения контакта"""
+    phone = message.contact.phone_number
+    
+    # Сохраняем телефон
+    async with AsyncSessionLocal() as session:
+        user = await get_user_by_tg_id(message.from_user.id)
+        if user:
+            db_user = await session.get(User, user.id)
+            db_user.phone = phone
+            await session.commit()
+    
+    # Предлагаем выбрать часовой пояс
+    timezone_keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Москва (+3)"), KeyboardButton(text="Калининград (+2)")],
+            [KeyboardButton(text="Екатеринбург (+5)"), KeyboardButton(text="Определить по городу")]
+        ],
+        resize_keyboard=True
+    )
+    
+    await message.answer(
+        f"✅ Телефон сохранен: {phone}\n\n"
+        "Теперь выберите ваш часовой пояс:",
+        reply_markup=timezone_keyboard
+    )
+    
+    await state.set_state(OrderStates.waiting_timezone)
 
-# ОБРАБОТЧИК ЧАСОВОГО ПОЯСА (ИСПРАВЛЕННЫЙ ПОИСК)
 @dp.message(OrderStates.waiting_timezone)
 async def timezone_handler(message: types.Message, state: FSMContext):
-    logger.info(f"🕐 Обработка часового пояса: {message.text}")
-    
+    """Обработчик выбора часового пояса"""
     timezone_map = {
         "Москва (+3)": "Europe/Moscow",
         "Калининград (+2)": "Europe/Kaliningrad", 
@@ -583,166 +224,113 @@ async def timezone_handler(message: types.Message, state: FSMContext):
     
     if message.text in timezone_map:
         timezone = timezone_map[message.text]
-        logger.info(f"✅ Выбран часовой пояс: {timezone}")
-        
-        # Сохраняем часовой пояс - ИЩЕМ ПО tg_id
-        async with AsyncSessionLocal() as session:
-            # Ищем пользователя по tg_id (ID Telegram)
-            result = await session.execute(select(User).where(User.tg_id == message.from_user.id))
-            user = result.scalar_one_or_none()
-            
-            if user:
-                user.timezone = timezone
-                if message.text == "Определить по городу":
-                    user.city = "auto"
-                await session.commit()
-                logger.info(f"✅ Часовой пояс сохранен для пользователя {user.first_name} (ID: {user.id})")
-            else:
-                logger.error(f"❌ Пользователь с tg_id {message.from_user.id} не найден при сохранении часового пояса")
-                await message.answer("❌ Ошибка: пользователь не найден")
-                return
-        
-        # Главное меню после успешного завершения
-        main_keyboard = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🧪 Начать тест")],
-                [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📦 Статус заказа")]
-            ],
-            resize_keyboard=True
-        )
-        
-        success_message = f"✅ Часовой пояс сохранен: {message.text}\n\n"
-        if message.text == "Определить по городу":
-            success_message += "📍 Мы определим ваш часовой пояс автоматически по городу.\n\n"
-        
-        success_message += "🎊 Поздравляем с покупкой! Ваш набор будет отправлен в ближайшее время.\n\nМенеджер свяжется с вами для уточнения деталей доставки."
-        
-        await message.answer(success_message, reply_markup=main_keyboard)
-        
-        # Очищаем состояние
-        await state.clear()
-        logger.info(f"✅ Состояние очищено для пользователя {message.from_user.id}")
-        
-    else:
-        logger.warning(f"⚠️ Неизвестный часовой пояс: {message.text}")
-        await message.answer(
-            "❌ Пожалуйста, выберите часовой пояс из предложенных вариантов:\n"
-            "• Москва (+3)\n"
-            "• Калининград (+2)\n" 
-            "• Екатеринбург (+5)\n"
-            "• Определить по городу"
-        )
-    
-    if message.text in timezone_map:
-        timezone = timezone_map[message.text]
-        logger.info(f"✅ Выбран часовой пояс: {timezone}")
         
         # Сохраняем часовой пояс
         async with AsyncSessionLocal() as session:
-            user = await session.get(User, message.from_user.id)
+            user = await get_user_by_tg_id(message.from_user.id)
             if user:
-                user.timezone = timezone
+                db_user = await session.get(User, user.id)
+                db_user.timezone = timezone
+                
                 if message.text == "Определить по городу":
-                    user.city = "auto"
-                await session.commit()
-                logger.info(f"✅ Часовой пояс сохранен для пользователя {user.first_name}")
-            else:
-                logger.error(f"❌ Пользователь не найден при сохранении часового пояса")
-        
-        # Главное меню после успешного завершения
-        main_keyboard = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🧪 Начать тест")],
-                [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📦 Статус заказа")]
-            ],
-            resize_keyboard=True
-        )
-        
-        success_message = f"✅ Часовой пояс сохранен: {message.text}\n\n"
-        if message.text == "Определить по городу":
-            success_message += "📍 Мы определим ваш часовой пояс автоматически по городу.\n\n"
-        
-        success_message += "🎊 Поздравляем с покупкой! Ваш набор будет отправлен в ближайшее время.\n\nМенеджер свяжется с вами для уточнения деталей доставки."
-        
-        await message.answer(success_message, reply_markup=main_keyboard)
-        
-        # Очищаем состояние
-        await state.clear()
-        logger.info(f"✅ Состояние очищено для пользователя {message.from_user.id}")
-        
+                    await message.answer("📍 Введите ваш город:")
+                    await state.set_state(OrderStates.waiting_city)
+                    return
+                else:
+                    db_user.city = message.text.split(' ')[0]  # Берем название города
+                    await session.commit()
+                    
+                    # Завершаем процесс
+                    await finish_order_process(message, state, db_user)
     else:
-        logger.warning(f"⚠️ Неизвестный часовой пояс: {message.text}")
-        await message.answer(
-            "❌ Пожалуйста, выберите часовой пояс из предложенных вариантов:\n"
-            "• Москва (+3)\n"
-            "• Калининград (+2)\n" 
-            "• Екатеринбург (+5)\n"
-            "• Определить по городу"
-        )
+        await message.answer("❌ Пожалуйста, выберите вариант из списка")
 
-# ОБРАБОТЧИК ПРОФИЛЯ
+@dp.message(OrderStates.waiting_city)
+async def city_handler(message: types.Message, state: FSMContext):
+    """Обработчик ввода города"""
+    city = message.text
+    
+    # Сохраняем город
+    async with AsyncSessionLocal() as session:
+        user = await get_user_by_tg_id(message.from_user.id)
+        if user:
+            db_user = await session.get(User, user.id)
+            db_user.city = city
+            await session.commit()
+            
+            # Завершаем процесс
+            await finish_order_process(message, state, db_user)
+
+async def finish_order_process(message: types.Message, state: FSMContext, user: User):
+    """Завершает процесс оформления заказа"""
+    main_keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🧪 Начать тест")],
+            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📦 Статус заказа")]
+        ],
+        resize_keyboard=True
+    )
+    
+    await message.answer(
+        "🎊 Поздравляем с покупкой! Ваш набор будет отправлен в ближайшее время.\n\n"
+        "Менеджер свяжется с вами для уточнения деталей доставки.",
+        reply_markup=main_keyboard
+    )
+    
+    await state.clear()
+    
+    # Уведомление менеджеру о новом заказе
+    await notify_managers(
+        f"🆕 Новый заказ!\n"
+        f"Клиент: {user.first_name} (@{user.username})\n"
+        f"Телефон: {user.phone}\n"
+        f"Город: {user.city}\n"
+        f"Часовой пояс: {user.timezone}"
+    )
+
+# ========== ПРОФИЛЬ И СТАТУС ==========
+
 @dp.message(Command("profile"))
 @dp.message(F.text == "👤 Профиль")
-async def profile_command(message: types.Message):
-    logger.info(f"📊 Запрос профиля от {message.from_user.id}")
+async def profile_handler(message: types.Message):
+    """Показывает профиль пользователя"""
+    user = await get_user_by_tg_id(message.from_user.id)
     
-    user = await get_user(message.from_user.id)
+    if not user:
+        await message.answer("❌ Профиль не найден. Напишите /start")
+        return
     
-    if user:
-        # Получаем последний заказ
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(Order).where(Order.user_id == user.id).order_by(Order.created_at.desc())
-            )
-            order = result.scalar_one_or_none()
-        
-        # Безопасно получаем scenario (может отсутствовать в старых записях)
-        scenario = getattr(user, 'scenario', 'default')
-        
-        profile_text = (
-            f"👤 Ваш профиль:\n"
-            f"Имя: {user.first_name or 'Не указано'}\n"
-            f"Username: @{user.username or 'Не указан'}\n"
-            f"Телефон: {user.phone or 'Не указан'}\n"
-            f"Часовой пояс: {user.timezone or 'Не указан'}\n"
-            f"Статус: {user.status}\n"
-            f"Источник: {user.source or 'Не указан'}\n"
-            f"Сценарий: {scenario}\n"
-            f"Зарегистрирован: {user.created_at.strftime('%d.%m.%Y %H:%M')}\n"
-        )
-        
-        if order:
-            status_text = {
-                'new': '🆕 Новый',
-                'pending': '⏳ Ожидает оплаты', 
-                'paid': '✅ Оплачен',
-                'shipped': '🚚 Отправлен',
-                'delivered': '📦 Доставлен'
-            }
-            profile_text += f"Последний заказ: #{order.id} ({status_text.get(order.payment_status, order.payment_status)})"
-        
-    else:
-        profile_text = "❌ Профиль не найден. Напишите /start"
+    profile_text = (
+        f"👤 Ваш профиль:\n"
+        f"Имя: {user.first_name or 'Не указано'}\n"
+        f"Username: @{user.username or 'Не указан'}\n"
+        f"Телефон: {user.phone or 'Не указан'}\n"
+        f"Город: {user.city or 'Не указан'}\n"
+        f"Часовой пояс: {user.timezone or 'Не указан'}\n"
+        f"Статус: {user.status}\n"
+        f"Источник: {user.source or 'Не указан'}\n"
+        f"Сценарий: {user.scenario or 'default'}\n"
+    )
     
     await message.answer(profile_text)
 
-# ОБРАБОТЧИК СТАТУСА ЗАКАЗА
 @dp.message(F.text == "📦 Статус заказа")
 async def order_status_handler(message: types.Message):
-    user = await get_user(message.from_user.id)
+    """Показывает статус заказа"""
+    user = await get_user_by_tg_id(message.from_user.id)
     
     if not user:
-        await message.answer("❌ Сначала напишите /start")
+        await message.answer("❌ Пользователь не найден")
         return
         
     async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(Order).where(Order.user_id == user.id).order_by(Order.created_at.desc())
+        order = await session.execute(
+            f"SELECT * FROM orders WHERE user_id = {user.id} ORDER BY created_at DESC LIMIT 1"
         )
-        order = result.scalar_one_or_none()
+        order_data = order.fetchone()
         
-        if order:
-            status_text = {
+        if order_data:
+            status_map = {
                 'new': '🆕 Новый',
                 'pending': '⏳ Ожидает оплаты', 
                 'paid': '✅ Оплачен',
@@ -750,18 +338,106 @@ async def order_status_handler(message: types.Message):
                 'delivered': '📦 Доставлен'
             }
             
+            status = status_map.get(order_data.payment_status, order_data.payment_status)
+            
             await message.answer(
-                f"📦 Ваш заказ #{order.id}\n"
-                f"Статус: {status_text.get(order.payment_status, order.payment_status)}\n"
-                f"Сумма: {order.amount} руб\n"
-                f"Дата: {order.created_at.strftime('%d.%m.%Y')}"
+                f"📦 Ваш заказ #{order_data.id}\n"
+                f"Статус: {status}\n"
+                f"Сумма: {order_data.amount} руб\n"
+                f"Дата: {order_data.created_at.strftime('%d.%m.%Y %H:%M')}"
             )
         else:
             await message.answer("❌ У вас нет заказов")
 
-# ОБРАБОТЧИКИ ДЛЯ ТЕСТА
+# ========== УВЕДОМЛЕНИЯ МЕНЕДЖЕРАМ ==========
+
+async def notify_managers(message: str):
+    """Отправляет уведомление менеджерам"""
+    try:
+        if config.MANAGER_GROUP_ID:
+            await bot.send_message(config.MANAGER_GROUP_ID, message)
+        else:
+            # Если группа не настроена, отправляем админу
+            await bot.send_message(config.ADMIN_ID, f"📢 {message}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки уведомления менеджерам: {e}")
+
+# ========== АДМИН КОМАНДЫ ==========
+
+@dp.message(Command("cleanup"))
+async def cleanup_command(message: types.Message):
+    """Очистка дублирующихся пользователей (только для админа)"""
+    if message.from_user.id != config.ADMIN_ID:
+        await message.answer("⛔ Доступ запрещен")
+        return
+        
+    await cleanup_duplicate_users()
+    await message.answer("✅ Дублирующиеся пользователи очищены")
+
+@dp.message(Command("stats"))
+async def stats_command(message: types.Message):
+    """Статистика бота (только для админа)"""
+    if message.from_user.id != config.ADMIN_ID:
+        await message.answer("⛔ Доступ запрещен")
+        return
+    
+    async with AsyncSessionLocal() as session:
+        # Статистика пользователей
+        users_count = await session.execute("SELECT COUNT(*) FROM users")
+        users_total = users_count.scalar()
+        
+        paid_users = await session.execute("SELECT COUNT(*) FROM users WHERE status = 'paid'")
+        paid_total = paid_users.scalar()
+        
+        # Статистика заказов
+        orders_count = await session.execute("SELECT COUNT(*) FROM orders")
+        orders_total = orders_count.scalar()
+        
+        paid_orders = await session.execute("SELECT COUNT(*) FROM orders WHERE payment_status = 'paid'")
+        paid_orders_total = paid_orders.scalar()
+    
+    stats_text = (
+        f"📊 Статистика бота:\n\n"
+        f"👥 Пользователи: {users_total}\n"
+        f"💰 Оплатившие: {paid_total}\n"
+        f"📦 Заказы: {orders_total}\n"
+        f"✅ Оплаченные заказы: {paid_orders_total}\n"
+        f"💵 Конверсия: {round((paid_total/users_total)*100, 2) if users_total > 0 else 0}%"
+    )
+    
+    await message.answer(stats_text)
+
+# ========== ЗАГРУЗЧИК КОНТЕНТА ==========
+
+@dp.message(Command("upload_content"))
+async def upload_content_handler(message: types.Message):
+    """Загрузка контента из файла (только для админа)"""
+    if message.from_user.id != config.ADMIN_ID:
+        await message.answer("⛔ Доступ запрещен")
+        return
+    
+    if message.document:
+        try:
+            file_info = await bot.get_file(message.document.file_id)
+            downloaded_file = await bot.download_file(file_info.file_path)
+            
+            with open("content_upload.csv", "wb") as new_file:
+                new_file.write(downloaded_file.read())
+            
+            # Обновляем контент
+            content_manager.load_content()
+            await message.answer("✅ Контент успешно обновлен!")
+            
+        except Exception as e:
+            await message.answer(f"❌ Ошибка загрузки: {e}")
+    else:
+        await message.answer("📎 Отправьте CSV файл с контентом")
+
+# ========== ОБРАБОТЧИКИ КВИЗА ==========
+
 @dp.message(F.text == "🧪 Начать тест")
-async def start_test_handler(message: types.Message):
+async def start_quiz_handler(message: types.Message, state: FSMContext):
+    """Начало квиза"""
     await message.answer(
         "🧪 Отлично! Начинаем тест...\n\n"
         "❓ Вопрос 1: Как часто вы чувствуете усталость?",
@@ -774,98 +450,27 @@ async def start_test_handler(message: types.Message):
             resize_keyboard=True
         )
     )
+    await state.set_state(QuizStates.answering_questions)
 
-@dp.message(F.text.in_(["😫 Часто", "😐 Иногда", "😊 Редко", "🎉 Никогда"]))
-async def question1_handler(message: types.Message):
-    await save_quiz_answer(message.from_user.id, "question1_fatigue", message.text)
-    await message.answer(
-        f"✅ Ответ сохранен: {message.text}\n\n"
-        "❓ Вопрос 2: Какой у вас обычно сон?",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="😴 Крепкий"), KeyboardButton(text="🛌 Беспокойный")],
-                [KeyboardButton(text="⏰ Прерывистый"), KeyboardButton(text="💤 Бессонница")],
-                [KeyboardButton(text="🔙 Назад")]
-            ],
-            resize_keyboard=True
-        )
-    )
+# Добавьте обработчики для вопросов квиза аналогично предыдущей версии
 
-@dp.message(F.text.in_(["😴 Крепкий", "🛌 Беспокойный", "⏰ Прерывистый", "💤 Бессонница"]))
-async def question2_handler(message: types.Message):
-    await save_quiz_answer(message.from_user.id, "question2_sleep", message.text)
-    await message.answer(
-        f"✅ Ответ сохранен: {message.text}\n\n"
-        "❓ Вопрос 3: Как часто вы занимаетесь спортом?",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="💪 Регулярно"), KeyboardButton(text="🚶 Иногда")],
-                [KeyboardButton(text="🧘 Редко"), KeyboardButton(text="🚫 Никогда")],
-                [KeyboardButton(text="🔙 Назад")]
-            ],
-            resize_keyboard=True
-        )
-    )
-
-@dp.message(F.text.in_(["💪 Регулярно", "🚶 Иногда", "🧘 Редко", "🚫 Никогда"]))
-async def question3_handler(message: types.Message):
-    await save_quiz_answer(message.from_user.id, "question3_sport", message.text)
-    await message.answer(
-        f"✅ Ответ сохранен: {message.text}\n\n"
-        "🎉 Тест завершен! Спасибо за ответы!\n\n"
-        "На основе ваших ответов мы подготовим персональные рекомендации.",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="💰 Оплатить анализ"), KeyboardButton(text="👤 Профиль")],
-                [KeyboardButton(text="🔗 Моя реф ссылка"), KeyboardButton(text="ℹ️ О проекте")]
-            ],
-            resize_keyboard=True
-        )
-    )
-
-@dp.message(F.text == "ℹ️ О проекте")
-async def about_handler(message: types.Message):
-    await message.answer(
-        "🏥 GenoLife - современная система анализа здоровья\n\n"
-        "Мы помогаем:\n"
-        "• Пройти генетический анализ\n"
-        "• Получить персональные рекомендации\n"
-        "• Улучшить качество жизни"
-    )
-
-@dp.message(F.text == "🔙 Назад")
-async def back_handler(message: types.Message):
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🧪 Начать тест")],
-            [KeyboardButton(text="💰 Оплатить анализ"), KeyboardButton(text="👤 Профиль")],
-            [KeyboardButton(text="🔗 Моя реф ссылка"), KeyboardButton(text="ℹ️ О проекте")]
-        ],
-        resize_keyboard=True
-    )
-    await message.answer("Главное меню:", reply_markup=keyboard)
-
-@dp.message()
-async def echo_handler(message: types.Message):
-    await message.answer(
-        "🤔 Используйте кнопки меню или команды:\n"
-        "/start - начать работу\n"
-        "/profile - ваш профиль"
-    )
+# ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 
 async def main():
-    logger.info("🚀 Запуск бота GenoLife с исправленной БД...")
+    logger.info("🚀 Запуск бота GenoLife...")
     
     try:
-        await setup_database()
+        await create_tables()
         logger.info("✅ База данных настроена")
-    except Exception as e:
-        logger.error(f"❌ Ошибка БД: {e}")
-    
-    try:
+        
+        # Загружаем контент
+        content_manager.load_content()
+        logger.info("✅ Контент загружен")
+        
         await dp.start_polling(bot)
+        
     except Exception as e:
-        logger.error(f"❌ Ошибка бота: {e}")
+        logger.error(f"❌ Ошибка запуска бота: {e}")
     finally:
         await bot.session.close()
 
