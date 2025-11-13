@@ -234,10 +234,10 @@ async def payment_handler(message: types.Message, state: FSMContext):
     # Создаем заказ
     order = await create_order(message.from_user.id, 2990.00)
     
-    # Инлайн-клавиатура для оплаты
+    # ТЕСТОВАЯ оплата - сразу переходим к подтверждению
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить 2990 руб", url="https://example.com/payment")],
+            [InlineKeyboardButton(text="💳 Тестовая оплата", callback_data=f"test_payment:{order.id}")],
             [InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data=f"paid:{order.id}")]
         ]
     )
@@ -249,11 +249,60 @@ async def payment_handler(message: types.Message, state: FSMContext):
         "• Комплект для сбора анализов\n"
         "• Подробный отчет\n"
         "• Персональные рекомендации\n\n"
-        "Нажмите кнопку ниже для оплаты:",
-        reply_markup=keyboard
+        "💡 *Для теста:* нажмите 'Тестовая оплата' или 'Я оплатил(а)'",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
     )
 
-# ОБРАБОТЧИК ПОДТВЕРЖДЕНИЯ ОПЛАТЫ
+# ТЕСТОВАЯ ОПЛАТА (имитация)
+@dp.callback_query(F.data.startswith("test_payment:"))
+async def test_payment_handler(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        order_id = int(callback.data.split(":")[1])
+        logger.info(f"🧪 Тестовая оплата для заказа #{order_id}")
+        
+        # Обновляем статус заказа
+        async with AsyncSessionLocal() as session:
+            order = await session.get(Order, order_id)
+            if order:
+                order.payment_status = 'paid'
+                order.payment_date = datetime.utcnow()
+                order.transaction_id = f"TEST_{uuid.uuid4()[:8]}"
+                await session.commit()
+                
+                # Обновляем статус пользователя
+                user_result = await session.execute(select(User).where(User.id == order.user_id))
+                user = user_result.scalar_one_or_none()
+                
+                if user:
+                    user.status = 'paid'
+                    await session.commit()
+                    
+                    logger.info(f"✅ Тестовая оплата подтверждена для заказа #{order_id}")
+                    
+                    await callback.message.answer(
+                        "🎉 Тестовая оплата подтверждена! Спасибо за заказ!\n\n"
+                        "Теперь нам нужны ваши контактные данные для доставки набора.",
+                        reply_markup=ReplyKeyboardMarkup(
+                            keyboard=[
+                                [KeyboardButton(text="📞 Оставить контакты", request_contact=True)]
+                            ],
+                            resize_keyboard=True
+                        )
+                    )
+                    
+                    await state.set_state(OrderStates.waiting_contacts)
+                    await callback.answer("✅ Тестовая оплата подтверждена!")
+                else:
+                    await callback.answer("❌ Пользователь не найден")
+            else:
+                await callback.answer("❌ Заказ не найден")
+                
+    except Exception as e:
+        logger.error(f"❌ Ошибка при тестовой оплате: {e}")
+        await callback.answer("❌ Произошла ошибка")
+
+# ОБРАБОТЧИК ПОДТВЕРЖДЕНИЯ ОПЛАТЫ (ИСПРАВЛЕННЫЙ)
 @dp.callback_query(F.data.startswith("paid:"))
 async def payment_confirmation_handler(callback: types.CallbackQuery, state: FSMContext):
     try:
@@ -269,26 +318,32 @@ async def payment_confirmation_handler(callback: types.CallbackQuery, state: FSM
                 order.transaction_id = str(uuid.uuid4())[:8]
                 await session.commit()
                 
-                # Обновляем статус пользователя
-                user = await session.get(User, order.user_id)
-                user.status = 'paid'
-                await session.commit()
+                # Обновляем статус пользователя (ИСПРАВЛЕННЫЙ ПОИСК)
+                user_result = await session.execute(select(User).where(User.id == order.user_id))
+                user = user_result.scalar_one_or_none()
                 
-                logger.info(f"✅ Оплата подтверждена для заказа #{order_id}")
-                
-                await callback.message.answer(
-                    "🎉 Оплата подтверждена! Спасибо за заказ!\n\n"
-                    "Теперь нам нужны ваши контактные данные для доставки набора.",
-                    reply_markup=ReplyKeyboardMarkup(
-                        keyboard=[
-                            [KeyboardButton(text="📞 Оставить контакты", request_contact=True)]
-                        ],
-                        resize_keyboard=True
+                if user:
+                    user.status = 'paid'
+                    await session.commit()
+                    
+                    logger.info(f"✅ Оплата подтверждена для заказа #{order_id}, пользователь {user.first_name}")
+                    
+                    await callback.message.answer(
+                        "🎉 Оплата подтверждена! Спасибо за заказ!\n\n"
+                        "Теперь нам нужны ваши контактные данные для доставки набора.",
+                        reply_markup=ReplyKeyboardMarkup(
+                            keyboard=[
+                                [KeyboardButton(text="📞 Оставить контакты", request_contact=True)]
+                            ],
+                            resize_keyboard=True
+                        )
                     )
-                )
-                
-                await state.set_state(OrderStates.waiting_contacts)
-                await callback.answer("✅ Оплата подтверждена!")
+                    
+                    await state.set_state(OrderStates.waiting_contacts)
+                    await callback.answer("✅ Оплата подтверждена!")
+                else:
+                    logger.error(f"❌ Пользователь не найден для заказа #{order_id}")
+                    await callback.answer("❌ Ошибка: пользователь не найден")
             else:
                 await callback.answer("❌ Заказ не найден")
                 
