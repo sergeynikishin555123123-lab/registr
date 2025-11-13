@@ -16,17 +16,12 @@ class User(Base):
     username = Column(String(100), nullable=True)
     first_name = Column(String(100), nullable=True)
     phone = Column(String(20), nullable=True)
-    email = Column(String(100), nullable=True)
     city = Column(String(100), nullable=True)
-    address = Column(Text, nullable=True)
     timezone = Column(String(50), nullable=True)
     source = Column(String(100), nullable=True)
     scenario = Column(String(50), default='default')
     status = Column(String(50), default='lead')
-    consent = Column(Boolean, default=False)
-    manager_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class QuizAnswer(Base):
     __tablename__ = "quiz_answers"
@@ -44,16 +39,6 @@ class Order(Base):
     payment_status = Column(String(50), default='new')
     payment_date = Column(DateTime, nullable=True)
     transaction_id = Column(String(100), nullable=True)
-    delivery_address = Column(Text, nullable=True)
-    delivery_status = Column(String(50), default='pending')
-    tracking_code = Column(String(100), nullable=True)
-    eta_date = Column(DateTime, nullable=True)
-    courier_date = Column(DateTime, nullable=True)
-    courier_time = Column(String(50), nullable=True)
-    in_lab_date = Column(DateTime, nullable=True)
-    results_date = Column(DateTime, nullable=True)
-    report_link = Column(Text, nullable=True)
-    consultation_status = Column(String(50), default='not_offered')
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # Database setup
@@ -64,8 +49,10 @@ async def create_tables():
     """Создаем таблицы в базе данных"""
     try:
         async with engine.begin() as conn:
+            # Удаляем существующие таблицы и создаем заново (для разработки)
+            await conn.run_sync(Base.metadata.drop_all)
             await conn.run_sync(Base.metadata.create_all)
-        logger.info("✅ Таблицы базы данных созданы")
+        logger.info("✅ Таблицы базы данных созданы заново")
     except Exception as e:
         logger.error(f"❌ Ошибка создания таблиц: {e}")
         raise
@@ -80,7 +67,6 @@ async def get_user_by_tg_id(tg_id: int):
             )
             user_data = result.fetchone()
             if user_data:
-                # Создаем объект User из данных строки
                 return User(**dict(user_data._mapping))
             return None
     except Exception as e:
@@ -101,7 +87,6 @@ async def get_or_create_user(tg_id: int, username: str, first_name: str, source:
                     user.username = username
                     user.first_name = first_name
                     user.source = source
-                    user.updated_at = datetime.utcnow()
                     await session.commit()
                     logger.info(f"✅ Обновлен пользователь: {first_name} (ID: {user.id})")
                     return user
@@ -184,13 +169,44 @@ async def update_user_status(user_id: int, status: str):
             user = await session.get(User, user_id)
             if user:
                 user.status = status
-                user.updated_at = datetime.utcnow()
                 await session.commit()
                 logger.info(f"✅ Обновлен статус пользователя #{user_id}: {status}")
                 return True
             return False
     except Exception as e:
         logger.error(f"❌ Ошибка обновления пользователя #{user_id}: {e}")
+        return False
+
+async def update_user_contact(user_id: int, phone: str):
+    """Обновляет контактные данные пользователя"""
+    try:
+        async with AsyncSessionLocal() as session:
+            user = await session.get(User, user_id)
+            if user:
+                user.phone = phone
+                await session.commit()
+                logger.info(f"✅ Обновлен телефон пользователя #{user_id}")
+                return True
+            return False
+    except Exception as e:
+        logger.error(f"❌ Ошибка обновления телефона пользователя #{user_id}: {e}")
+        return False
+
+async def update_user_timezone(user_id: int, timezone: str, city: str = None):
+    """Обновляет часовой пояс пользователя"""
+    try:
+        async with AsyncSessionLocal() as session:
+            user = await session.get(User, user_id)
+            if user:
+                user.timezone = timezone
+                if city:
+                    user.city = city
+                await session.commit()
+                logger.info(f"✅ Обновлен часовой пояс пользователя #{user_id}: {timezone}")
+                return True
+            return False
+    except Exception as e:
+        logger.error(f"❌ Ошибка обновления часового пояса пользователя #{user_id}: {e}")
         return False
 
 async def get_user_orders(user_id: int):
