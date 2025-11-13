@@ -1,7 +1,7 @@
 import logging
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, BigInteger, DateTime, Text, Float, Boolean, JSON, text
+from sqlalchemy import Column, Integer, String, BigInteger, DateTime, Text, Float, Boolean, text
 from datetime import datetime
 from config import config
 
@@ -56,83 +56,56 @@ class Order(Base):
     consultation_status = Column(String(50), default='not_offered')
     created_at = Column(DateTime, default=datetime.utcnow)
 
-class Notification(Base):
-    __tablename__ = "notifications"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, index=True)
-    type = Column(String(50))  # reminder / courier / program / etc.
-    scheduled_for = Column(DateTime)
-    sent = Column(Boolean, default=False)
-    sent_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class ProgramProgress(Base):
-    __tablename__ = "program_progress"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, index=True)
-    day_number = Column(Integer)
-    completed = Column(Boolean, default=False)
-    skipped = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class Manager(Base):
-    __tablename__ = "managers"
-    id = Column(Integer, primary_key=True, index=True)
-    tg_id = Column(BigInteger, unique=True, index=True)
-    username = Column(String(100), nullable=True)
-    first_name = Column(String(100), nullable=True)
-    is_active = Column(Boolean, default=True)
-    can_edit_content = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class ReferralLink(Base):
-    __tablename__ = "referral_links"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100))
-    source_code = Column(String(50), unique=True)
-    scenario = Column(String(50))
-    is_active = Column(Boolean, default=True)
-    created_by = Column(Integer)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
 # Database setup
 engine = create_async_engine(config.DATABASE_URL, echo=True)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 async def create_tables():
     """Создаем таблицы в базе данных"""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("✅ Таблицы базы данных созданы")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("✅ Таблицы базы данных созданы")
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания таблиц: {e}")
+        raise
 
 async def get_user_by_tg_id(tg_id: int):
     """Получаем пользователя по Telegram ID"""
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(text("SELECT * FROM users WHERE tg_id = :tg_id"), {"tg_id": tg_id})
-        user_data = result.fetchone()
-        if user_data:
-            # Создаем объект User из данных строки
-            user_dict = dict(user_data._mapping)
-            return User(**user_dict)
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                text("SELECT * FROM users WHERE tg_id = :tg_id"), 
+                {"tg_id": tg_id}
+            )
+            user_data = result.fetchone()
+            if user_data:
+                # Создаем объект User из данных строки
+                return User(**dict(user_data._mapping))
+            return None
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения пользователя {tg_id}: {e}")
         return None
 
 async def get_or_create_user(tg_id: int, username: str, first_name: str, source: str = 'direct'):
     """Получаем или создаем пользователя"""
-    async with AsyncSessionLocal() as session:
-        # Пытаемся найти существующего пользователя
-        existing_user = await get_user_by_tg_id(tg_id)
-        
-        if existing_user:
-            # Обновляем данные существующего пользователя
-            user = await session.get(User, existing_user.id)
-            user.username = username
-            user.first_name = first_name
-            user.source = source
-            user.updated_at = datetime.utcnow()
-            await session.commit()
-            logger.info(f"✅ Обновлен пользователь: {first_name} (ID: {user.id})")
-            return user
-        else:
+    try:
+        async with AsyncSessionLocal() as session:
+            # Пытаемся найти существующего пользователя
+            existing_user = await get_user_by_tg_id(tg_id)
+            
+            if existing_user:
+                # Обновляем данные существующего пользователя
+                user = await session.get(User, existing_user.id)
+                if user:
+                    user.username = username
+                    user.first_name = first_name
+                    user.source = source
+                    user.updated_at = datetime.utcnow()
+                    await session.commit()
+                    logger.info(f"✅ Обновлен пользователь: {first_name} (ID: {user.id})")
+                    return user
+            
             # Создаем нового пользователя
             user = User(
                 tg_id=tg_id,
@@ -146,17 +119,109 @@ async def get_or_create_user(tg_id: int, username: str, first_name: str, source:
             await session.refresh(user)
             logger.info(f"✅ Создан новый пользователь: {first_name} (ID: {user.id})")
             return user
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания/обновления пользователя: {e}")
+        return None
+
+async def create_order(user_id: int, amount: float):
+    """Создает заказ"""
+    try:
+        async with AsyncSessionLocal() as session:
+            order = Order(
+                user_id=user_id,
+                amount=amount,
+                payment_status='pending'
+            )
+            session.add(order)
+            await session.commit()
+            await session.refresh(order)
+            logger.info(f"💰 Создан заказ #{order.id} для пользователя {user_id}")
+            return order
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания заказа: {e}")
+        return None
+
+async def save_quiz_answer(user_id: int, question_id: str, answer: str):
+    """Сохраняет ответ на вопрос квиза"""
+    try:
+        async with AsyncSessionLocal() as session:
+            quiz_answer = QuizAnswer(
+                user_id=user_id,
+                question_id=question_id,
+                answer=answer
+            )
+            session.add(quiz_answer)
+            await session.commit()
+            logger.info(f"💾 Сохранен ответ: {question_id} = {answer}")
+            return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения ответа: {e}")
+        return False
+
+async def update_order_payment(order_id: int, status: str, transaction_id: str = None):
+    """Обновляет статус оплаты заказа"""
+    try:
+        async with AsyncSessionLocal() as session:
+            order = await session.get(Order, order_id)
+            if order:
+                order.payment_status = status
+                order.payment_date = datetime.utcnow()
+                if transaction_id:
+                    order.transaction_id = transaction_id
+                await session.commit()
+                logger.info(f"✅ Обновлен заказ #{order_id}: статус {status}")
+                return True
+            return False
+    except Exception as e:
+        logger.error(f"❌ Ошибка обновления заказа #{order_id}: {e}")
+        return False
+
+async def update_user_status(user_id: int, status: str):
+    """Обновляет статус пользователя"""
+    try:
+        async with AsyncSessionLocal() as session:
+            user = await session.get(User, user_id)
+            if user:
+                user.status = status
+                user.updated_at = datetime.utcnow()
+                await session.commit()
+                logger.info(f"✅ Обновлен статус пользователя #{user_id}: {status}")
+                return True
+            return False
+    except Exception as e:
+        logger.error(f"❌ Ошибка обновления пользователя #{user_id}: {e}")
+        return False
+
+async def get_user_orders(user_id: int):
+    """Получает заказы пользователя"""
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                text("SELECT * FROM orders WHERE user_id = :user_id ORDER BY created_at DESC"),
+                {"user_id": user_id}
+            )
+            orders_data = result.fetchall()
+            return [Order(**dict(order._mapping)) for order in orders_data]
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения заказов пользователя {user_id}: {e}")
+        return []
 
 async def cleanup_duplicate_users():
-    """Удаляем дублирующихся пользователей"""
-    async with AsyncSessionLocal() as session:
-        await session.execute(text("""
-            DELETE FROM users 
-            WHERE id NOT IN (
-                SELECT MIN(id) 
-                FROM users 
-                GROUP BY tg_id
-            )
-        """))
-        await session.commit()
-        logger.info("✅ Дублирующиеся пользователи очищены")
+    """Удаляет дублирующихся пользователей"""
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("""
+                DELETE FROM users 
+                WHERE id NOT IN (
+                    SELECT MIN(id) 
+                    FROM users 
+                    GROUP BY tg_id
+                )
+            """))
+            await session.commit()
+            logger.info("✅ Дублирующиеся пользователи очищены")
+            return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка очистки дублирующихся пользователей: {e}")
+        return False
