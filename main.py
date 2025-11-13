@@ -118,7 +118,7 @@ async def setup_database():
     logger.info("✅ База данных полностью настроена")
 
 async def get_user(tg_id: int):
-    """Получаем пользователя из БД"""
+    """Получаем пользователя из БД по tg_id"""
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(User).where(User.tg_id == tg_id))
         return result.scalar_one_or_none()
@@ -374,23 +374,26 @@ async def payment_confirmation_handler(callback: types.CallbackQuery, state: FSM
         logger.error(f"❌ Ошибка при подтверждении оплаты: {e}")
         await callback.answer("❌ Произошла ошибка")
 
-# ОБРАБОТЧИК КОНТАКТОВ (ОСНОВНОЙ)
+# ОБРАБОТЧИК КОНТАКТОВ (ИСПРАВЛЕННЫЙ ПОИСК)
 @dp.message(OrderStates.waiting_contacts, F.contact)
 async def contact_handler(message: types.Message, state: FSMContext):
     try:
         phone = message.contact.phone_number
         logger.info(f"📞 Получен контакт: {phone} от пользователя {message.from_user.id}")
         
-        # Сохраняем контакт
+        # Сохраняем контакт - ИЩЕМ ПО tg_id (ID Telegram), а не по id БД
         async with AsyncSessionLocal() as session:
-            user = await session.get(User, message.from_user.id)
+            # Ищем пользователя по tg_id (ID Telegram)
+            result = await session.execute(select(User).where(User.tg_id == message.from_user.id))
+            user = result.scalar_one_or_none()
+            
             if user:
                 user.phone = phone
                 await session.commit()
-                logger.info(f"✅ Телефон сохранен для пользователя {user.first_name}")
+                logger.info(f"✅ Телефон сохранен для пользователя {user.first_name} (ID: {user.id})")
             else:
-                logger.error(f"❌ Пользователь {message.from_user.id} не найден при сохранении телефона")
-                await message.answer("❌ Ошибка: пользователь не найден")
+                logger.error(f"❌ Пользователь с tg_id {message.from_user.id} не найден в БД")
+                await message.answer("❌ Ошибка: пользователь не найден в базе данных")
                 return
         
         # Создаем клавиатуру для выбора часового пояса
@@ -416,17 +419,7 @@ async def contact_handler(message: types.Message, state: FSMContext):
         logger.error(f"❌ Ошибка при обработке контакта: {e}")
         await message.answer("❌ Произошла ошибка при сохранении контакта")
 
-# ОБРАБОТЧИК ДЛЯ НЕПРАВИЛЬНЫХ СООБЩЕНИЙ В СОСТОЯНИИ waiting_contacts
-@dp.message(OrderStates.waiting_contacts)
-async def wrong_contact_handler(message: types.Message):
-    """Обрабатывает текстовые сообщения когда ожидается контакт"""
-    logger.info(f"⚠️ Получено текстовое сообщение вместо контакта: {message.text}")
-    await message.answer(
-        "❌ Пожалуйста, нажмите кнопку '📞 Оставить контакты' для отправки телефона\n\n"
-        "Это необходимо для доставки набора анализов."
-    )
-
-# ОБРАБОТЧИК ЧАСОВОГО ПОЯСА (ОСНОВНОЙ)
+# ОБРАБОТЧИК ЧАСОВОГО ПОЯСА (ИСПРАВЛЕННЫЙ ПОИСК)
 @dp.message(OrderStates.waiting_timezone)
 async def timezone_handler(message: types.Message, state: FSMContext):
     logger.info(f"🕐 Обработка часового пояса: {message.text}")
@@ -437,6 +430,58 @@ async def timezone_handler(message: types.Message, state: FSMContext):
         "Екатеринбург (+5)": "Asia/Yekaterinburg",
         "Определить по городу": "auto"
     }
+    
+    if message.text in timezone_map:
+        timezone = timezone_map[message.text]
+        logger.info(f"✅ Выбран часовой пояс: {timezone}")
+        
+        # Сохраняем часовой пояс - ИЩЕМ ПО tg_id
+        async with AsyncSessionLocal() as session:
+            # Ищем пользователя по tg_id (ID Telegram)
+            result = await session.execute(select(User).where(User.tg_id == message.from_user.id))
+            user = result.scalar_one_or_none()
+            
+            if user:
+                user.timezone = timezone
+                if message.text == "Определить по городу":
+                    user.city = "auto"
+                await session.commit()
+                logger.info(f"✅ Часовой пояс сохранен для пользователя {user.first_name} (ID: {user.id})")
+            else:
+                logger.error(f"❌ Пользователь с tg_id {message.from_user.id} не найден при сохранении часового пояса")
+                await message.answer("❌ Ошибка: пользователь не найден")
+                return
+        
+        # Главное меню после успешного завершения
+        main_keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="🧪 Начать тест")],
+                [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📦 Статус заказа")]
+            ],
+            resize_keyboard=True
+        )
+        
+        success_message = f"✅ Часовой пояс сохранен: {message.text}\n\n"
+        if message.text == "Определить по городу":
+            success_message += "📍 Мы определим ваш часовой пояс автоматически по городу.\n\n"
+        
+        success_message += "🎊 Поздравляем с покупкой! Ваш набор будет отправлен в ближайшее время.\n\nМенеджер свяжется с вами для уточнения деталей доставки."
+        
+        await message.answer(success_message, reply_markup=main_keyboard)
+        
+        # Очищаем состояние
+        await state.clear()
+        logger.info(f"✅ Состояние очищено для пользователя {message.from_user.id}")
+        
+    else:
+        logger.warning(f"⚠️ Неизвестный часовой пояс: {message.text}")
+        await message.answer(
+            "❌ Пожалуйста, выберите часовой пояс из предложенных вариантов:\n"
+            "• Москва (+3)\n"
+            "• Калининград (+2)\n" 
+            "• Екатеринбург (+5)\n"
+            "• Определить по городу"
+        )
     
     if message.text in timezone_map:
         timezone = timezone_map[message.text]
