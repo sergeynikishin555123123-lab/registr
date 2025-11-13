@@ -8,7 +8,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import Column, Integer, String, BigInteger, DateTime, Text, Float, Boolean, select
+from sqlalchemy import Column, Integer, String, BigInteger, DateTime, Text, Float, Boolean, select, text
 from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime
 import uuid
@@ -36,7 +36,7 @@ class User(Base):
     city = Column(String(100), nullable=True)
     timezone = Column(String(50), nullable=True)
     source = Column(String(100), nullable=True)
-    scenario = Column(String(50), default='default')
+    scenario = Column(String(50), default='default')  # ДОБАВЛЯЕМ КОЛОНКУ
     status = Column(String(50), default='lead')
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -68,6 +68,41 @@ async def create_tables():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("✅ Таблицы базы данных созданы")
+
+async def add_missing_columns():
+    """Добавляем отсутствующие колонки в существующие таблицы"""
+    async with engine.begin() as conn:
+        # Проверяем существование колонки scenario в таблице users
+        result = await conn.execute(text("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'users' AND column_name = 'scenario'
+        """))
+        scenario_exists = result.scalar() is not None
+        
+        if not scenario_exists:
+            logger.info("🔄 Добавляем колонку scenario в таблицу users...")
+            await conn.execute(text("ALTER TABLE users ADD COLUMN scenario VARCHAR(50) DEFAULT 'default'"))
+            logger.info("✅ Колонка scenario добавлена")
+        
+        # Проверяем другие возможные отсутствующие колонки
+        columns_to_check = ['phone', 'city', 'timezone', 'source']
+        for column in columns_to_check:
+            result = await conn.execute(text(f"""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'users' AND column_name = '{column}'
+            """))
+            if result.scalar() is None:
+                logger.info(f"🔄 Добавляем колонку {column} в таблицу users...")
+                if column in ['phone', 'city', 'timezone', 'source']:
+                    await conn.execute(text(f"ALTER TABLE users ADD COLUMN {column} VARCHAR(100)"))
+                logger.info(f"✅ Колонка {column} добавлена")
+
+async def setup_database():
+    """Настраиваем базу данных"""
+    await create_tables()
+    await add_missing_columns()
 
 async def get_user(tg_id: int):
     """Получаем пользователя из БД"""
@@ -160,10 +195,11 @@ async def start_command(message: types.Message):
         source
     )
     
-    # Обновляем сценарий
+    # Обновляем сценарий (безопасно, так как колонка теперь есть)
     async with AsyncSessionLocal() as session:
         db_user = await session.get(User, message.from_user.id)
-        db_user.scenario = scenario
+        if hasattr(db_user, 'scenario'):
+            db_user.scenario = scenario
         await session.commit()
     
     # Клавиатура
@@ -217,7 +253,7 @@ async def payment_handler(message: types.Message, state: FSMContext):
         reply_markup=keyboard
     )
 
-# ОБРАБОТЧИК ПОДТВЕРЖДЕНИЯ ОПЛАТЫ (ИСПРАВЛЕННЫЙ)
+# ОБРАБОТЧИК ПОДТВЕРЖДЕНИЯ ОПЛАТЫ
 @dp.callback_query(F.data.startswith("paid:"))
 async def payment_confirmation_handler(callback: types.CallbackQuery, state: FSMContext):
     try:
@@ -292,7 +328,7 @@ async def timezone_handler(message: types.Message, state: FSMContext):
     timezone_map = {
         "Москва (+3)": "Europe/Moscow",
         "Калининград (+2)": "Europe/Kaliningrad", 
-        "Екатеринбург (+5)": "Asia/Yekaterinburg"
+        "Екатеринград (+5)": "Asia/Yekaterinburg"
     }
     
     if message.text in timezone_map:
@@ -321,7 +357,7 @@ async def timezone_handler(message: types.Message, state: FSMContext):
     else:
         await message.answer("❌ Пожалуйста, выберите часовой пояс из предложенных вариантов")
 
-# ОБРАБОТЧИК ПРОФИЛЯ (ИСПРАВЛЕННЫЙ)
+# ОБРАБОТЧИК ПРОФИЛЯ
 @dp.message(Command("profile"))
 @dp.message(F.text == "👤 Профиль")
 async def profile_command(message: types.Message):
@@ -337,6 +373,9 @@ async def profile_command(message: types.Message):
             )
             order = result.scalar_one_or_none()
         
+        # Безопасно получаем scenario (может отсутствовать в старых записях)
+        scenario = getattr(user, 'scenario', 'default')
+        
         profile_text = (
             f"👤 Ваш профиль:\n"
             f"Имя: {user.first_name or 'Не указано'}\n"
@@ -345,7 +384,7 @@ async def profile_command(message: types.Message):
             f"Часовой пояс: {user.timezone or 'Не указан'}\n"
             f"Статус: {user.status}\n"
             f"Источник: {user.source or 'Не указан'}\n"
-            f"Сценарий: {user.scenario}\n"
+            f"Сценарий: {scenario}\n"
             f"Зарегистрирован: {user.created_at.strftime('%d.%m.%Y %H:%M')}\n"
         )
         
@@ -397,7 +436,7 @@ async def order_status_handler(message: types.Message):
         else:
             await message.answer("❌ У вас нет заказов")
 
-# ОБРАБОТЧИКИ ДЛЯ ТЕСТА (оставляем как были)
+# ОБРАБОТЧИКИ ДЛЯ ТЕСТА
 @dp.message(F.text == "🧪 Начать тест")
 async def start_test_handler(message: types.Message):
     await message.answer(
@@ -492,10 +531,11 @@ async def echo_handler(message: types.Message):
     )
 
 async def main():
-    logger.info("🚀 Запуск бота GenoLife с исправленными обработчиками...")
+    logger.info("🚀 Запуск бота GenoLife с исправленной БД...")
     
     try:
-        await create_tables()
+        await setup_database()
+        logger.info("✅ База данных настроена")
     except Exception as e:
         logger.error(f"❌ Ошибка БД: {e}")
     
