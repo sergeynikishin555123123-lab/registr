@@ -49,6 +49,8 @@ class QuizStates(StatesGroup):
 async def handle_manager_commands(callback: types.CallbackQuery):
     """Обработчик команд менеджера"""
     try:
+        logger.info(f"🛠 Получена команда менеджера: {callback.data} от {callback.from_user.id}")
+        
         result = await manager_bot.handle_manager_command(callback.data, callback.from_user.id)
         await callback.answer(result)
         
@@ -65,10 +67,14 @@ async def handle_manager_commands(callback: types.CallbackQuery):
 async def notify_managers(message: str, user_id: int = None, order_id: int = None):
     """Отправляет уведомление менеджерам"""
     try:
+        logger.info(f"📢 Отправка уведомления менеджерам: {message[:100]}...")
+        
+        # Отправляем текстовое уведомление
         await manager_bot.notify_managers(message)
         
         # Если указан user_id, отправляем карточку клиента
         if user_id:
+            logger.info(f"📋 Отправка карточки клиента {user_id}")
             await manager_bot.send_user_card(user_id, order_id)
             
     except Exception as e:
@@ -343,7 +349,8 @@ async def test_payment_handler(callback: types.CallbackQuery, state: FSMContext)
                 f"💰 *НОВАЯ ОПЛАТА!*\n\n"
                 f"👤 *Клиент:* {user.first_name} (@{user.username})\n"
                 f"💵 *Сумма:* 2 990 руб\n"
-                f"🆔 *ID заказа:* {order_id}",
+                f"🆔 *ID заказа:* {order_id}\n"
+                f"📅 *Время:* {datetime.now().strftime('%d.%m.%Y %H:%M')}",
                 user_id=user.id,
                 order_id=order_id
             )
@@ -388,7 +395,8 @@ async def confirm_payment_handler(callback: types.CallbackQuery, state: FSMConte
                 f"💰 *ПОДТВЕРЖДЕНА ОПЛАТА!*\n\n"
                 f"👤 *Клиент:* {user.first_name}\n"
                 f"💵 *Сумма:* 2 990 руб\n"
-                f"🆔 *ID заказа:* {order_id}",
+                f"🆔 *ID заказа:* {order_id}\n"
+                f"📅 *Время:* {datetime.now().strftime('%d.%m.%Y %H:%M')}",
                 user_id=user.id
             )
         
@@ -569,7 +577,8 @@ async def timezone_handler(message: types.Message, state: FSMContext):
                 f"👤 *Клиент:* {user.first_name}\n"
                 f"📞 *Телефон:* {user.phone}\n"
                 f"📍 *Город:* {city or 'Не указан'}\n"
-                f"🕐 *Часовой пояс:* {timezone}",
+                f"🕐 *Часовой пояс:* {timezone}\n"
+                f"📅 *Время оформления:* {datetime.now().strftime('%d.%m.%Y %H:%M')}",
                 user_id=user.id
             )
     else:
