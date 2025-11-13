@@ -40,6 +40,54 @@ class QuizStates(StatesGroup):
     question2 = State()
     question3 = State()
 
+# ========== ОБРАБОТЧИК КНОПКИ ОПЛАТЫ ПОСЛЕ КВИЗА ==========
+
+@dp.message(F.text == "💳 Заказать анализ со скидкой")
+async def offer_payment_after_quiz_handler(message: types.Message):
+    """Обработчик кнопки оплаты после квиза - ДОЛЖЕН БЫТЬ ПЕРВЫМ"""
+    logger.info(f"💳 Получена кнопка оплаты после квиза от {message.from_user.id}")
+    
+    user = await get_user_by_tg_id(message.from_user.id)
+    if not user:
+        await message.answer("❌ Сначала зарегистрируйтесь через /start")
+        return
+    
+    # Создаем заказ в БД
+    async with AsyncSessionLocal() as session:
+        order = Order(
+            user_id=user.id,
+            amount=2990.00,
+            payment_status='pending'
+        )
+        session.add(order)
+        await session.commit()
+        await session.refresh(order)
+    
+    # Инлайн клавиатура для оплаты
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Перейти к оплате", callback_data=f"payment:{order.id}")],
+            [InlineKeyboardButton(text="🧪 Пройти тест еще раз", callback_data="retry_quiz")],
+            [InlineKeyboardButton(text="📞 Связаться с менеджером", callback_data="contact_manager")]
+        ]
+    )
+    
+    await message.answer(
+        "💰 *Специальное предложение после теста!*\n\n"
+        "🎁 *Полный анализ GenoLife со скидкой 20%*\n\n"
+        "*Что входит:*\n"
+        "• Комплект для сбора анализов (доставка бесплатно)\n"
+        "• 4 пробирки для сбора образцов\n"
+        "• Подробный отчет с расшифровкой\n"
+        "• Персональные рекомендации\n"
+        "• 14-дневная программа восстановления\n\n"
+        "*💵 Стоимость:* ~~3 737 руб~~ *2 990 руб*\n"
+        "*Экономия: 747 руб!*\n\n"
+        "⏰ *Предложение действительно 24 часа*",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
 
 @dp.message(CommandStart())
@@ -241,54 +289,10 @@ async def cancel_quiz_handler(message: types.Message, state: FSMContext):
         reply_markup=keyboard
     )
 
-# ========== ПРЕДЛОЖЕНИЕ ОПЛАТЫ ПОСЛЕ КВИЗА ==========
-
-@dp.message(F.text == "💳 Заказать анализ со скидкой")
-async def offer_payment_after_quiz(message: types.Message, state: FSMContext):
-    """Предложение оплаты после завершения квиза"""
-    user = await get_user_by_tg_id(message.from_user.id)
-    if not user:
-        await message.answer("❌ Сначала зарегистрируйтесь через /start")
-        return
-    
-    # Создаем заказ в БД
-    async with AsyncSessionLocal() as session:
-        order = Order(
-            user_id=user.id,
-            amount=2990.00,
-            payment_status='pending'
-        )
-        session.add(order)
-        await session.commit()
-        await session.refresh(order)
-    
-    # Инлайн клавиатура для оплаты
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Перейти к оплате", callback_data=f"payment:{order.id}")],
-            [InlineKeyboardButton(text="🧪 Пройти тест еще раз", callback_data="retry_quiz")],
-            [InlineKeyboardButton(text="📞 Связаться с менеджером", callback_data="contact_manager")]
-        ]
-    )
-    
-    await message.answer(
-        "💰 *Специальное предложение после теста!*\n\n"
-        "🎁 *Полный анализ GenoLife со скидкой 20%*\n\n"
-        "*Что входит:*\n"
-        "• Комплект для сбора анализов (доставка бесплатно)\n"
-        "• 4 пробирки для сбора образцов\n"
-        "• Подробный отчет с расшифровкой\n"
-        "• Персональные рекомендации\n"
-        "• 14-дневная программа восстановления\n\n"
-        "*💵 Стоимость:* ~~3 737 руб~~ *2 990 руб*\n"
-        "*Экономия: 747 руб!*\n\n"
-        "⏰ *Предложение действительно 24 часа*",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
+# ========== ОБРАБОТЧИКИ CALLBACK КНОПОК ==========
 
 @dp.callback_query(F.data.startswith("payment:"))
-async def payment_callback_handler(callback: types.CallbackQuery, state: FSMContext):
+async def payment_callback_handler(callback: types.CallbackQuery):
     """Обработчик перехода к оплате"""
     order_id = int(callback.data.split(":")[1])
     
@@ -335,6 +339,17 @@ async def retry_quiz_handler(callback: types.CallbackQuery, state: FSMContext):
         )
     )
     await state.set_state(QuizStates.question1)
+    await callback.answer()
+
+@dp.callback_query(F.data == "contact_manager")
+async def contact_manager_handler(callback: types.CallbackQuery):
+    """Обработчик связи с менеджером"""
+    await callback.message.answer(
+        "📞 *Связь с менеджером*\n\n"
+        "Наш менеджер свяжется с вами в ближайшее время в рабочие часы.\n\n"
+        "Если вопрос срочный, вы можете написать нам напрямую: @genolife_support",
+        parse_mode="Markdown"
+    )
     await callback.answer()
 
 # ========== СИСТЕМА ОПЛАТЫ ==========
@@ -419,136 +434,6 @@ async def confirm_payment_handler(callback: types.CallbackQuery, state: FSMConte
     except Exception as e:
         logger.error(f"❌ Ошибка подтверждения оплаты: {e}")
         await callback.answer("❌ Ошибка")
-
-# ========== СБОР КОНТАКТОВ И ЧАСОВОГО ПОЯСА ==========
-
-@dp.message(OrderStates.waiting_contacts, F.contact)
-async def contact_received_handler(message: types.Message, state: FSMContext):
-    """Обработчик получения контакта"""
-    phone = message.contact.phone_number
-    
-    # Сохраняем телефон
-    async with AsyncSessionLocal() as session:
-        user = await get_user_by_tg_id(message.from_user.id)
-        if user:
-            db_user = await session.get(User, user.id)
-            db_user.phone = phone
-            await session.commit()
-    
-    # Предлагаем выбрать часовой пояс
-    timezone_keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Москва (+3)"), KeyboardButton(text="Калининград (+2)")],
-            [KeyboardButton(text="Екатеринбург (+5)"), KeyboardButton(text="Определить по городу")]
-        ],
-        resize_keyboard=True
-    )
-    
-    await message.answer(
-        f"✅ *Телефон сохранен:* {phone}\n\n"
-        "🕐 *Теперь выберите ваш часовой пояс:*\n\n"
-        "Это нужно для:\n"
-        "• Напоминаний о сборе анализов\n"
-        "• Планирования времени курьера\n"
-        "• Утренних уведомлений",
-        parse_mode="Markdown",
-        reply_markup=timezone_keyboard
-    )
-    
-    await state.set_state(OrderStates.waiting_timezone)
-
-@dp.message(OrderStates.waiting_contacts)
-async def wrong_contact_handler(message: types.Message):
-    """Обрабатывает некорректные сообщения в состоянии ожидания контакта"""
-    await message.answer(
-        "❌ Пожалуйста, нажмите кнопку '📞 Оставить контакты' для отправки телефона"
-    )
-
-@dp.message(OrderStates.waiting_timezone)
-async def timezone_handler(message: types.Message, state: FSMContext):
-    """Обработчик выбора часового пояса"""
-    timezone_map = {
-        "Москва (+3)": "Europe/Moscow",
-        "Калининград (+2)": "Europe/Kaliningrad", 
-        "Екатеринбург (+5)": "Asia/Yekaterinburg",
-        "Определить по городу": "auto"
-    }
-    
-    if message.text in timezone_map:
-        timezone = timezone_map[message.text]
-        
-        # Сохраняем часовой пояс
-        async with AsyncSessionLocal() as session:
-            user = await get_user_by_tg_id(message.from_user.id)
-            if user:
-                db_user = await session.get(User, user.id)
-                db_user.timezone = timezone
-                
-                if message.text == "Определить по городу":
-                    await message.answer("📍 *Введите ваш город для определения часового пояса:*", parse_mode="Markdown")
-                    await state.set_state(OrderStates.waiting_city)
-                    return
-                else:
-                    db_user.city = message.text.split(' ')[0]  # Берем название города
-                    await session.commit()
-                    
-                    # Завершаем процесс
-                    await finish_order_process(message, state, db_user)
-    else:
-        await message.answer("❌ Пожалуйста, выберите вариант из списка")
-
-@dp.message(OrderStates.waiting_city)
-async def city_handler(message: types.Message, state: FSMContext):
-    """Обработчик ввода города"""
-    city = message.text
-    
-    # Сохраняем город
-    async with AsyncSessionLocal() as session:
-        user = await get_user_by_tg_id(message.from_user.id)
-        if user:
-            db_user = await session.get(User, user.id)
-            db_user.city = city
-            await session.commit()
-            
-            # Завершаем процесс
-            await finish_order_process(message, state, db_user)
-
-async def finish_order_process(message: types.Message, state: FSMContext, user: User):
-    """Завершает процесс оформления заказа"""
-    main_keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📦 Статус заказа"), KeyboardButton(text="👤 Профиль")],
-            [KeyboardButton(text="🔗 Моя реф ссылка"), KeyboardButton(text="ℹ️ О проекте")]
-        ],
-        resize_keyboard=True
-    )
-    
-    await message.answer(
-        "🎊 *Поздравляем с покупкой!*\n\n"
-        "✅ *Ваш заказ оформлен!*\n\n"
-        "*Что дальше:*\n"
-        "1. В ближайшее время менеджер свяжется для уточнения деталей доставки\n"
-        "2. Вы получите набор для сбора анализов\n"
-        "3. После сбора образцов курьер заберет их\n"
-        "4. Через 7-10 дней вы получите подробный отчет\n\n"
-        "📞 *По всем вопросам обращайтесь к менеджеру*",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard
-    )
-    
-    await state.clear()
-    
-    # Уведомление менеджеру о новом заказе
-    await notify_managers(
-        f"🆕 *НОВЫЙ ЗАКАЗ!*\n\n"
-        f"👤 *Клиент:* {user.first_name} (@{user.username})\n"
-        f"📞 *Телефон:* {user.phone}\n"
-        f"📍 *Город:* {user.city}\n"
-        f"🕐 *Часовой пояс:* {user.timezone}\n"
-        f"🔗 *Источник:* {user.source}\n\n"
-        f"💵 *Сумма:* 2 990 руб\n"
-        f"🆔 *ID заказа:* {user.id}"
-    )
 
 # ========== ОБРАБОТЧИКИ ГЛАВНОГО МЕНЮ ==========
 
@@ -709,6 +594,136 @@ async def about_handler(message: types.Message):
         "*📞 Свяжитесь с нами для консультации!*"
     )
     await message.answer(about_text, parse_mode="Markdown")
+
+# ========== СБОР КОНТАКТОВ И ЧАСОВОГО ПОЯСА ==========
+
+@dp.message(OrderStates.waiting_contacts, F.contact)
+async def contact_received_handler(message: types.Message, state: FSMContext):
+    """Обработчик получения контакта"""
+    phone = message.contact.phone_number
+    
+    # Сохраняем телефон
+    async with AsyncSessionLocal() as session:
+        user = await get_user_by_tg_id(message.from_user.id)
+        if user:
+            db_user = await session.get(User, user.id)
+            db_user.phone = phone
+            await session.commit()
+    
+    # Предлагаем выбрать часовой пояс
+    timezone_keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Москва (+3)"), KeyboardButton(text="Калининград (+2)")],
+            [KeyboardButton(text="Екатеринбург (+5)"), KeyboardButton(text="Определить по городу")]
+        ],
+        resize_keyboard=True
+    )
+    
+    await message.answer(
+        f"✅ *Телефон сохранен:* {phone}\n\n"
+        "🕐 *Теперь выберите ваш часовой пояс:*\n\n"
+        "Это нужно для:\n"
+        "• Напоминаний о сборе анализов\n"
+        "• Планирования времени курьера\n"
+        "• Утренних уведомлений",
+        parse_mode="Markdown",
+        reply_markup=timezone_keyboard
+    )
+    
+    await state.set_state(OrderStates.waiting_timezone)
+
+@dp.message(OrderStates.waiting_contacts)
+async def wrong_contact_handler(message: types.Message):
+    """Обрабатывает некорректные сообщения в состоянии ожидания контакта"""
+    await message.answer(
+        "❌ Пожалуйста, нажмите кнопку '📞 Оставить контакты' для отправки телефона"
+    )
+
+@dp.message(OrderStates.waiting_timezone)
+async def timezone_handler(message: types.Message, state: FSMContext):
+    """Обработчик выбора часового пояса"""
+    timezone_map = {
+        "Москва (+3)": "Europe/Moscow",
+        "Калининград (+2)": "Europe/Kaliningrad", 
+        "Екатеринбург (+5)": "Asia/Yekaterinburg",
+        "Определить по городу": "auto"
+    }
+    
+    if message.text in timezone_map:
+        timezone = timezone_map[message.text]
+        
+        # Сохраняем часовой пояс
+        async with AsyncSessionLocal() as session:
+            user = await get_user_by_tg_id(message.from_user.id)
+            if user:
+                db_user = await session.get(User, user.id)
+                db_user.timezone = timezone
+                
+                if message.text == "Определить по городу":
+                    await message.answer("📍 *Введите ваш город для определения часового пояса:*", parse_mode="Markdown")
+                    await state.set_state(OrderStates.waiting_city)
+                    return
+                else:
+                    db_user.city = message.text.split(' ')[0]  # Берем название города
+                    await session.commit()
+                    
+                    # Завершаем процесс
+                    await finish_order_process(message, state, db_user)
+    else:
+        await message.answer("❌ Пожалуйста, выберите вариант из списка")
+
+@dp.message(OrderStates.waiting_city)
+async def city_handler(message: types.Message, state: FSMContext):
+    """Обработчик ввода города"""
+    city = message.text
+    
+    # Сохраняем город
+    async with AsyncSessionLocal() as session:
+        user = await get_user_by_tg_id(message.from_user.id)
+        if user:
+            db_user = await session.get(User, user.id)
+            db_user.city = city
+            await session.commit()
+            
+            # Завершаем процесс
+            await finish_order_process(message, state, db_user)
+
+async def finish_order_process(message: types.Message, state: FSMContext, user: User):
+    """Завершает процесс оформления заказа"""
+    main_keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📦 Статус заказа"), KeyboardButton(text="👤 Профиль")],
+            [KeyboardButton(text="🔗 Моя реф ссылка"), KeyboardButton(text="ℹ️ О проекте")]
+        ],
+        resize_keyboard=True
+    )
+    
+    await message.answer(
+        "🎊 *Поздравляем с покупкой!*\n\n"
+        "✅ *Ваш заказ оформлен!*\n\n"
+        "*Что дальше:*\n"
+        "1. В ближайшее время менеджер свяжется для уточнения деталей доставки\n"
+        "2. Вы получите набор для сбора анализов\n"
+        "3. После сбора образцов курьер заберет их\n"
+        "4. Через 7-10 дней вы получите подробный отчет\n\n"
+        "📞 *По всем вопросам обращайтесь к менеджеру*",
+        parse_mode="Markdown",
+        reply_markup=main_keyboard
+    )
+    
+    await state.clear()
+    
+    # Уведомление менеджеру о новом заказе
+    await notify_managers(
+        f"🆕 *НОВЫЙ ЗАКАЗ!*\n\n"
+        f"👤 *Клиент:* {user.first_name} (@{user.username})\n"
+        f"📞 *Телефон:* {user.phone}\n"
+        f"📍 *Город:* {user.city}\n"
+        f"🕐 *Часовой пояс:* {user.timezone}\n"
+        f"🔗 *Источник:* {user.source}\n\n"
+        f"💵 *Сумма:* 2 990 руб\n"
+        f"🆔 *ID заказа:* {user.id}"
+    )
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
