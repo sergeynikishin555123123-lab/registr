@@ -16,6 +16,7 @@ from database import (
     create_order, save_quiz_answer, update_order_payment, update_user_status,
     update_user_contact, update_user_timezone, get_user_orders, cleanup_duplicate_users
 )
+from managers import init_manager_bot, manager_bot
 
 # Настройка логирования
 logging.basicConfig(
@@ -29,6 +30,9 @@ bot = Bot(token=config.BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
+# Инициализируем менеджерский бот
+manager_bot = init_manager_bot(bot)
+
 # Состояния для FSM
 class OrderStates(StatesGroup):
     waiting_contacts = State()
@@ -38,6 +42,37 @@ class QuizStates(StatesGroup):
     question1 = State()
     question2 = State()
     question3 = State()
+
+# ========== МЕНЕДЖЕРСКИЕ КОМАНДЫ ==========
+
+@dp.callback_query(F.data.startswith(("send_kit:", "courier:", "in_lab:", "results_ready:", "consult:", "start_program:", "fail_collect:")))
+async def handle_manager_commands(callback: types.CallbackQuery):
+    """Обработчик команд менеджера"""
+    try:
+        result = await manager_bot.handle_manager_command(callback.data, callback.from_user.id)
+        await callback.answer(result)
+        
+        # Обновляем карточку клиента
+        user_id = int(callback.data.split(":")[1])
+        await manager_bot.send_user_card(user_id)
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки команды менеджера: {e}")
+        await callback.answer("❌ Ошибка выполнения команды")
+
+# ========== УВЕДОМЛЕНИЯ МЕНЕДЖЕРАМ ==========
+
+async def notify_managers(message: str, user_id: int = None, order_id: int = None):
+    """Отправляет уведомление менеджерам"""
+    try:
+        await manager_bot.notify_managers(message)
+        
+        # Если указан user_id, отправляем карточку клиента
+        if user_id:
+            await manager_bot.send_user_card(user_id, order_id)
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки уведомления менеджерам: {e}")
 
 # ========== ОБРАБОТЧИК КНОПКИ ОПЛАТЫ ПОСЛЕ КВИЗА ==========
 
@@ -302,9 +337,16 @@ async def test_payment_handler(callback: types.CallbackQuery, state: FSMContext)
         await state.set_state(OrderStates.waiting_contacts)
         await callback.answer("✅ Тестовая оплата подтверждена!")
         
-        # Уведомление менеджеру
+        # Уведомление менеджерам с карточкой клиента
         if user:
-            await notify_managers(f"💰 Новая оплата от {user.first_name} (@{user.username})")
+            await notify_managers(
+                f"💰 *НОВАЯ ОПЛАТА!*\n\n"
+                f"👤 *Клиент:* {user.first_name} (@{user.username})\n"
+                f"💵 *Сумма:* 2 990 руб\n"
+                f"🆔 *ID заказа:* {order_id}",
+                user_id=user.id,
+                order_id=order_id
+            )
             
     except Exception as e:
         logger.error(f"❌ Ошибка тестовой оплаты: {e}")
@@ -339,6 +381,16 @@ async def confirm_payment_handler(callback: types.CallbackQuery, state: FSMConte
         
         await state.set_state(OrderStates.waiting_contacts)
         await callback.answer("✅ Оплата подтверждена!")
+        
+        # Уведомление менеджерам
+        if user:
+            await notify_managers(
+                f"💰 *ПОДТВЕРЖДЕНА ОПЛАТА!*\n\n"
+                f"👤 *Клиент:* {user.first_name}\n"
+                f"💵 *Сумма:* 2 990 руб\n"
+                f"🆔 *ID заказа:* {order_id}",
+                user_id=user.id
+            )
         
     except Exception as e:
         logger.error(f"❌ Ошибка подтверждения оплаты: {e}")
@@ -513,27 +565,15 @@ async def timezone_handler(message: types.Message, state: FSMContext):
         # Уведомление менеджеру
         if user:
             await notify_managers(
-                f"🆕 *НОВЫЙ ЗАКАЗ!*\n\n"
+                f"🆕 *НОВЫЙ ЗАКАЗ! ДАННЫЕ КЛИЕНТА:*\n\n"
                 f"👤 *Клиент:* {user.first_name}\n"
                 f"📞 *Телефон:* {user.phone}\n"
-                f"🕐 *Часовой пояс:* {timezone}"
+                f"📍 *Город:* {city or 'Не указан'}\n"
+                f"🕐 *Часовой пояс:* {timezone}",
+                user_id=user.id
             )
     else:
         await message.answer("❌ Пожалуйста, выберите вариант из списка")
-
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-
-async def notify_managers(message: str):
-    """Отправляет уведомление менеджерам"""
-    try:
-        if config.MANAGER_GROUP_ID:
-            await bot.send_message(config.MANAGER_GROUP_ID, message, parse_mode="Markdown")
-        else:
-            # Если группа не настроена, отправляем админу
-            await bot.send_message(config.ADMIN_ID, f"📢 {message}", parse_mode="Markdown")
-        logger.info("📢 Уведомление отправлено менеджерам")
-    except Exception as e:
-        logger.error(f"❌ Ошибка отправки уведомления менеджерам: {e}")
 
 # ========== АДМИН КОМАНДЫ ==========
 
@@ -546,6 +586,71 @@ async def cleanup_command(message: types.Message):
         
     await cleanup_duplicate_users()
     await message.answer("✅ Дублирующиеся пользователи очищены")
+
+@dp.message(Command("manager"))
+async def manager_command(message: types.Message):
+    """Команды для менеджера"""
+    if message.from_user.id != config.ADMIN_ID:
+        await message.answer("⛔ Доступ запрещен")
+        return
+    
+    help_text = (
+        "👨‍💼 *Панель менеджера*\n\n"
+        "*Доступные команды:*\n"
+        "• /stats - статистика бота\n"
+        "• /users - список пользователей\n"
+        "• /orders - список заказов\n"
+        "• /cleanup - очистка дублей\n\n"
+        "*Управление через кнопки:*\n"
+        "В карточках клиентов доступны кнопки для управления статусами."
+    )
+    
+    await message.answer(help_text, parse_mode="Markdown")
+
+@dp.message(Command("stats"))
+async def stats_command(message: types.Message):
+    """Статистика бота (только для админа)"""
+    if message.from_user.id != config.ADMIN_ID:
+        await message.answer("⛔ Доступ запрещен")
+        return
+    
+    from database import AsyncSessionLocal
+    from sqlalchemy import text
+    
+    async with AsyncSessionLocal() as session:
+        # Статистика пользователей
+        users_count = await session.execute(text("SELECT COUNT(*) FROM users"))
+        users_total = users_count.scalar()
+        
+        paid_users = await session.execute(text("SELECT COUNT(*) FROM users WHERE status = 'paid'"))
+        paid_total = paid_users.scalar()
+        
+        # Статистика заказов
+        orders_count = await session.execute(text("SELECT COUNT(*) FROM orders"))
+        orders_total = orders_count.scalar()
+        
+        paid_orders = await session.execute(text("SELECT COUNT(*) FROM orders WHERE payment_status = 'paid'"))
+        paid_orders_total = paid_orders.scalar()
+        
+        # Статистика квизов
+        quiz_count = await session.execute(text("SELECT COUNT(DISTINCT user_id) FROM quiz_answers"))
+        quiz_total = quiz_count.scalar()
+    
+    conversion = round((paid_total/users_total)*100, 2) if users_total > 0 else 0
+    quiz_conversion = round((paid_total/quiz_total)*100, 2) if quiz_total > 0 else 0
+    
+    stats_text = (
+        f"📊 *Статистика бота:*\n\n"
+        f"👥 *Пользователи:* {users_total}\n"
+        f"🧪 *Прошли квиз:* {quiz_total}\n"
+        f"💰 *Оплатившие:* {paid_total}\n"
+        f"📦 *Заказы:* {orders_total}\n"
+        f"✅ *Оплаченные заказы:* {paid_orders_total}\n"
+        f"💵 *Общая конверсия:* {conversion}%\n"
+        f"🎯 *Конверсия из квиза:* {quiz_conversion}%"
+    )
+    
+    await message.answer(stats_text, parse_mode="Markdown")
 
 # ========== ОБРАБОТЧИК НЕИЗВЕСТНЫХ СООБЩЕНИЙ ==========
 
