@@ -121,7 +121,99 @@ async def get_user(tg_id: int):
     """Получаем пользователя из БД по tg_id"""
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(User).where(User.tg_id == tg_id))
-        return result.scalar_one_or_none()
+        user = result.scalar_one_or_none()
+        logger.info(f"🔍 Поиск пользователя {tg_id}: {'найден' if user else 'не найден'}")
+        return user
+
+# ОБРАБОТЧИК ПРОФИЛЯ (ИСПРАВЛЕННЫЙ)
+@dp.message(Command("profile"))
+@dp.message(F.text == "👤 Профиль")
+async def profile_command(message: types.Message):
+    logger.info(f"📊 Запрос профиля от {message.from_user.id}")
+    
+    user = await get_user(message.from_user.id)
+    
+    if user:
+        # Получаем последний заказ - ИЩЕМ ПО user.id (ID в БД)
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Order).where(Order.user_id == user.id).order_by(Order.created_at.desc())
+            )
+            order = result.scalar_one_or_none()
+        
+        # Безопасно получаем данные
+        scenario = getattr(user, 'scenario', 'default')
+        
+        profile_text = (
+            f"👤 Ваш профиль:\n"
+            f"ID в БД: {user.id}\n"
+            f"ID Telegram: {user.tg_id}\n"
+            f"Имя: {user.first_name or 'Не указано'}\n"
+            f"Username: @{user.username or 'Не указан'}\n"
+            f"Телефон: {user.phone or 'Не указан'}\n"
+            f"Часовой пояс: {user.timezone or 'Не указан'}\n"
+            f"Статус: {user.status}\n"
+            f"Источник: {user.source or 'Не указан'}\n"
+            f"Сценарий: {scenario}\n"
+            f"Зарегистрирован: {user.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+        )
+        
+        if order:
+            status_text = {
+                'new': '🆕 Новый',
+                'pending': '⏳ Ожидает оплаты', 
+                'paid': '✅ Оплачен',
+                'shipped': '🚚 Отправлен',
+                'delivered': '📦 Доставлен'
+            }
+            profile_text += f"Последний заказ: #{order.id} ({status_text.get(order.payment_status, order.payment_status)})"
+        else:
+            profile_text += "Заказов нет"
+        
+    else:
+        profile_text = "❌ Профиль не найден в базе данных. Напишите /start для регистрации"
+        logger.error(f"❌ Пользователь {message.from_user.id} не найден при запросе профиля")
+    
+    await message.answer(profile_text)
+
+# ОБРАБОТЧИК СТАТУСА ЗАКАЗА (ИСПРАВЛЕННЫЙ)
+@dp.message(F.text == "📦 Статус заказа")
+async def order_status_handler(message: types.Message):
+    logger.info(f"📦 Запрос статуса заказа от {message.from_user.id}")
+    
+    user = await get_user(message.from_user.id)
+    
+    if not user:
+        await message.answer("❌ Пользователь не найден. Сначала напишите /start")
+        logger.error(f"❌ Пользователь {message.from_user.id} не найден при запросе статуса заказа")
+        return
+        
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(Order).where(Order.user_id == user.id).order_by(Order.created_at.desc())
+        )
+        order = result.scalar_one_or_none()
+        
+        if order:
+            status_text = {
+                'new': '🆕 Новый',
+                'pending': '⏳ Ожидает оплаты', 
+                'paid': '✅ Оплачен',
+                'shipped': '🚚 Отправлен',
+                'delivered': '📦 Доставлен'
+            }
+            
+            await message.answer(
+                f"📦 Ваш заказ #{order.id}\n"
+                f"Статус: {status_text.get(order.payment_status, order.payment_status)}\n"
+                f"Сумма: {order.amount} руб\n"
+                f"Дата: {order.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+                f"ID пользователя в БД: {user.id}"
+            )
+            logger.info(f"✅ Показан статус заказа #{order.id} для пользователя {user.id}")
+        else:
+            await message.answer("❌ У вас нет заказов")
+            logger.info(f"ℹ️ У пользователя {user.id} нет заказов")
 
 async def get_or_create_user(tg_id: int, username: str, first_name: str, source: str = 'direct'):
     """Получаем или создаем пользователя"""
