@@ -7,6 +7,7 @@ from aiogram.types import ReplyKeyboardRemove, ReplyKeyboardMarkup, KeyboardButt
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
+from datetime import datetime
 
 from config import config
 from database import (
@@ -68,6 +69,12 @@ async def start_command(message: types.Message):
         source=source
     )
     
+    # Обновляем сценарий пользователя
+    async with AsyncSessionLocal() as session:
+        db_user = await session.get(User, user.id)
+        db_user.scenario = scenario
+        await session.commit()
+    
     # Получаем контент для сценария
     welcome_key = f'welcome_{scenario}'
     welcome_content = content_manager.get(welcome_key) or content_manager.get('welcome_default')
@@ -80,15 +87,17 @@ async def start_command(message: types.Message):
         buttons = ['🧪 Начать тест', '💰 Оплатить анализ', '👤 Профиль', '🔗 Моя реф ссылка', 'ℹ️ О проекте']
     
     # Создаем клавиатуру
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=btn)] for btn in buttons],
-        resize_keyboard=True
-    )
+    keyboard_buttons = []
+    for i in range(0, len(buttons), 2):
+        row = buttons[i:i+2]
+        keyboard_buttons.append([KeyboardButton(text=btn) for btn in row])
+    
+    keyboard = ReplyKeyboardMarkup(keyboard=keyboard_buttons, resize_keyboard=True)
     
     await message.answer(welcome_text, reply_markup=keyboard)
     logger.info(f"🔗 Пользователь {user.first_name} пришел из: {source}, сценарий: {scenario}")
 
-# ========== РЕФЕРАЛЬНАЯ СИСТЕМА ==========
+# ========== ОБРАБОТЧИКИ КНОПОК ГЛАВНОГО МЕНЮ ==========
 
 @dp.message(F.text == "🔗 Моя реф ссылка")
 async def my_referral_handler(message: types.Message):
@@ -102,8 +111,6 @@ async def my_referral_handler(message: types.Message):
         f"Поделитесь этой ссылкой с друзьями!",
         parse_mode="Markdown"
     )
-
-# ========== СИСТЕМА ОПЛАТЫ ==========
 
 @dp.message(F.text == "💰 Оплатить анализ")
 async def payment_handler(message: types.Message, state: FSMContext):
@@ -137,6 +144,81 @@ async def payment_handler(message: types.Message, state: FSMContext):
     )
     
     await message.answer(payment_text, reply_markup=keyboard)
+
+@dp.message(F.text == "👤 Профиль")
+async def profile_handler(message: types.Message):
+    """Показывает профиль пользователя"""
+    user = await get_user_by_tg_id(message.from_user.id)
+    
+    if not user:
+        await message.answer("❌ Профиль не найден. Напишите /start")
+        return
+    
+    profile_text = (
+        f"👤 Ваш профиль:\n"
+        f"Имя: {user.first_name or 'Не указано'}\n"
+        f"Username: @{user.username or 'Не указан'}\n"
+        f"Телефон: {user.phone or 'Не указан'}\n"
+        f"Город: {user.city or 'Не указан'}\n"
+        f"Часовой пояс: {user.timezone or 'Не указан'}\n"
+        f"Статус: {user.status}\n"
+        f"Источник: {user.source or 'Не указан'}\n"
+        f"Сценарий: {getattr(user, 'scenario', 'default')}\n"
+    )
+    
+    await message.answer(profile_text)
+
+@dp.message(F.text == "📦 Статус заказа")
+async def order_status_handler(message: types.Message):
+    """Показывает статус заказа"""
+    user = await get_user_by_tg_id(message.from_user.id)
+    
+    if not user:
+        await message.answer("❌ Пользователь не найден")
+        return
+        
+    async with AsyncSessionLocal() as session:
+        from sqlalchemy import select
+        result = await session.execute(
+            select(Order).where(Order.user_id == user.id).order_by(Order.created_at.desc())
+        )
+        order = result.scalar_one_or_none()
+        
+        if order:
+            status_map = {
+                'new': '🆕 Новый',
+                'pending': '⏳ Ожидает оплаты', 
+                'paid': '✅ Оплачен',
+                'shipped': '🚚 Отправлен',
+                'delivered': '📦 Доставлен'
+            }
+            
+            status = status_map.get(order.payment_status, order.payment_status)
+            
+            await message.answer(
+                f"📦 Ваш заказ #{order.id}\n"
+                f"Статус: {status}\n"
+                f"Сумма: {order.amount} руб\n"
+                f"Дата: {order.created_at.strftime('%d.%m.%Y %H:%M')}"
+            )
+        else:
+            await message.answer("❌ У вас нет заказов")
+
+@dp.message(F.text == "ℹ️ О проекте")
+async def about_handler(message: types.Message):
+    """Информация о проекте"""
+    about_text = (
+        "🏥 GenoLife - современная система анализа здоровья\n\n"
+        "Мы помогаем:\n"
+        "• Пройти генетический анализ\n"
+        "• Получить персональные рекомендации\n" 
+        "• Улучшить качество жизни\n"
+        "• Восстановить энергетический баланс\n\n"
+        "📞 Свяжитесь с нами для консультации!"
+    )
+    await message.answer(about_text)
+
+# ========== СИСТЕМА ОПЛАТЫ ==========
 
 @dp.callback_query(F.data.startswith("test_pay:"))
 async def test_payment_handler(callback: types.CallbackQuery, state: FSMContext):
@@ -175,10 +257,49 @@ async def test_payment_handler(callback: types.CallbackQuery, state: FSMContext)
                 
                 # Уведомление менеджеру
                 await notify_managers(f"💰 Новая оплата от {user.first_name} (@{user.username})")
+            else:
+                await callback.answer("❌ Заказ не найден")
                 
     except Exception as e:
         logger.error(f"❌ Ошибка тестовой оплаты: {e}")
         await callback.answer("❌ Ошибка оплаты")
+
+@dp.callback_query(F.data.startswith("confirm_pay:"))
+async def confirm_payment_handler(callback: types.CallbackQuery, state: FSMContext):
+    """Обработчик подтверждения оплаты"""
+    try:
+        order_id = int(callback.data.split(":")[1])
+        
+        async with AsyncSessionLocal() as session:
+            order = await session.get(Order, order_id)
+            if order:
+                order.payment_status = 'paid'
+                order.payment_date = datetime.utcnow()
+                
+                user = await session.get(User, order.user_id)
+                user.status = 'paid'
+                
+                await session.commit()
+                
+                await callback.message.answer(
+                    "🎉 Оплата подтверждена! Спасибо за заказ!\n\n"
+                    "Теперь нам нужны ваши контактные данные для доставки набора.",
+                    reply_markup=ReplyKeyboardMarkup(
+                        keyboard=[[KeyboardButton(text="📞 Оставить контакты", request_contact=True)]],
+                        resize_keyboard=True
+                    )
+                )
+                
+                await state.set_state(OrderStates.waiting_contacts)
+                await callback.answer("✅ Оплата подтверждена!")
+                
+                await notify_managers(f"💰 Подтверждена оплата от {user.first_name}")
+            else:
+                await callback.answer("❌ Заказ не найден")
+                
+    except Exception as e:
+        logger.error(f"❌ Ошибка подтверждения оплаты: {e}")
+        await callback.answer("❌ Ошибка")
 
 # ========== СБОР КОНТАКТОВ И АДРЕСА ==========
 
@@ -211,6 +332,13 @@ async def contact_received_handler(message: types.Message, state: FSMContext):
     )
     
     await state.set_state(OrderStates.waiting_timezone)
+
+@dp.message(OrderStates.waiting_contacts)
+async def wrong_contact_handler(message: types.Message):
+    """Обрабатывает некорректные сообщения в состоянии ожидания контакта"""
+    await message.answer(
+        "❌ Пожалуйста, нажмите кнопку '📞 Оставить контакты' для отправки телефона"
+    )
 
 @dp.message(OrderStates.waiting_timezone)
 async def timezone_handler(message: types.Message, state: FSMContext):
@@ -288,68 +416,133 @@ async def finish_order_process(message: types.Message, state: FSMContext, user: 
         f"Часовой пояс: {user.timezone}"
     )
 
-# ========== ПРОФИЛЬ И СТАТУС ==========
+# ========== СИСТЕМА КВИЗА ==========
 
-@dp.message(Command("profile"))
-@dp.message(F.text == "👤 Профиль")
-async def profile_handler(message: types.Message):
-    """Показывает профиль пользователя"""
-    user = await get_user_by_tg_id(message.from_user.id)
+@dp.message(F.text == "🧪 Начать тест")
+async def start_quiz_handler(message: types.Message, state: FSMContext):
+    """Начало квиза"""
+    await message.answer(
+        "🧪 Отлично! Начинаем тест...\n\n"
+        "❓ Вопрос 1: Как часто вы чувствуете усталость?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="😫 Часто"), KeyboardButton(text="😐 Иногда")],
+                [KeyboardButton(text="😊 Редко"), KeyboardButton(text="🎉 Никогда")],
+                [KeyboardButton(text="🔙 Назад в меню")]
+            ],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(QuizStates.answering_questions)
+    await state.update_data(current_question=1)
+
+@dp.message(QuizStates.answering_questions, F.text.in_(["😫 Часто", "😐 Иногда", "😊 Редко", "🎉 Никогда"]))
+async def question1_handler(message: types.Message, state: FSMContext):
+    """Обработчик первого вопроса"""
+    user_data = await state.get_data()
+    current_question = user_data.get('current_question', 1)
     
-    if not user:
-        await message.answer("❌ Профиль не найден. Напишите /start")
-        return
+    # Сохраняем ответ
+    await save_quiz_answer(message.from_user.id, f"question{current_question}_fatigue", message.text)
     
-    profile_text = (
-        f"👤 Ваш профиль:\n"
-        f"Имя: {user.first_name or 'Не указано'}\n"
-        f"Username: @{user.username or 'Не указан'}\n"
-        f"Телефон: {user.phone or 'Не указан'}\n"
-        f"Город: {user.city or 'Не указан'}\n"
-        f"Часовой пояс: {user.timezone or 'Не указан'}\n"
-        f"Статус: {user.status}\n"
-        f"Источник: {user.source or 'Не указан'}\n"
-        f"Сценарий: {user.scenario or 'default'}\n"
+    await message.answer(
+        f"✅ Ответ сохранен: {message.text}\n\n"
+        "❓ Вопрос 2: Какой у вас обычно сон?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="😴 Крепкий"), KeyboardButton(text="🛌 Беспокойный")],
+                [KeyboardButton(text="⏰ Прерывистый"), KeyboardButton(text="💤 Бессонница")],
+                [KeyboardButton(text="🔙 Назад в меню")]
+            ],
+            resize_keyboard=True
+        )
     )
     
-    await message.answer(profile_text)
+    await state.update_data(current_question=2)
 
-@dp.message(F.text == "📦 Статус заказа")
-async def order_status_handler(message: types.Message):
-    """Показывает статус заказа"""
-    user = await get_user_by_tg_id(message.from_user.id)
+@dp.message(QuizStates.answering_questions, F.text.in_(["😴 Крепкий", "🛌 Беспокойный", "⏰ Прерывистый", "💤 Бессонница"]))
+async def question2_handler(message: types.Message, state: FSMContext):
+    """Обработчик второго вопроса"""
+    user_data = await state.get_data()
+    current_question = user_data.get('current_question', 2)
     
-    if not user:
-        await message.answer("❌ Пользователь не найден")
-        return
-        
-    async with AsyncSessionLocal() as session:
-        order = await session.execute(
-            f"SELECT * FROM orders WHERE user_id = {user.id} ORDER BY created_at DESC LIMIT 1"
+    # Сохраняем ответ
+    await save_quiz_answer(message.from_user.id, f"question{current_question}_sleep", message.text)
+    
+    await message.answer(
+        f"✅ Ответ сохранен: {message.text}\n\n"
+        "❓ Вопрос 3: Как часто вы занимаетесь спортом?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="💪 Регулярно"), KeyboardButton(text="🚶 Иногда")],
+                [KeyboardButton(text="🧘 Редко"), KeyboardButton(text="🚫 Никогда")],
+                [KeyboardButton(text="🔙 Назад в меню")]
+            ],
+            resize_keyboard=True
         )
-        order_data = order.fetchone()
-        
-        if order_data:
-            status_map = {
-                'new': '🆕 Новый',
-                'pending': '⏳ Ожидает оплаты', 
-                'paid': '✅ Оплачен',
-                'shipped': '🚚 Отправлен',
-                'delivered': '📦 Доставлен'
-            }
-            
-            status = status_map.get(order_data.payment_status, order_data.payment_status)
-            
-            await message.answer(
-                f"📦 Ваш заказ #{order_data.id}\n"
-                f"Статус: {status}\n"
-                f"Сумма: {order_data.amount} руб\n"
-                f"Дата: {order_data.created_at.strftime('%d.%m.%Y %H:%M')}"
-            )
-        else:
-            await message.answer("❌ У вас нет заказов")
+    )
+    
+    await state.update_data(current_question=3)
 
-# ========== УВЕДОМЛЕНИЯ МЕНЕДЖЕРАМ ==========
+@dp.message(QuizStates.answering_questions, F.text.in_(["💪 Регулярно", "🚶 Иногда", "🧘 Редко", "🚫 Никогда"]))
+async def question3_handler(message: types.Message, state: FSMContext):
+    """Обработчик третьего вопроса - завершение квиза"""
+    # Сохраняем ответ
+    await save_quiz_answer(message.from_user.id, "question3_sport", message.text)
+    
+    # Главное меню
+    main_keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🧪 Начать тест")],
+            [KeyboardButton(text="💰 Оплатить анализ"), KeyboardButton(text="👤 Профиль")],
+            [KeyboardButton(text="🔗 Моя реф ссылка"), KeyboardButton(text="ℹ️ О проекте")]
+        ],
+        resize_keyboard=True
+    )
+    
+    await message.answer(
+        f"✅ Ответ сохранен: {message.text}\n\n"
+        "🎉 Тест завершен! Спасибо за ответы!\n\n"
+        "На основе ваших ответов мы подготовим персональные рекомендации.",
+        reply_markup=main_keyboard
+    )
+    
+    await state.clear()
+
+@dp.message(F.text == "🔙 Назад в меню")
+async def back_to_menu_handler(message: types.Message, state: FSMContext):
+    """Возврат в главное меню из любого состояния"""
+    await state.clear()
+    
+    main_keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🧪 Начать тест")],
+            [KeyboardButton(text="💰 Оплатить анализ"), KeyboardButton(text="👤 Профиль")],
+            [KeyboardButton(text="🔗 Моя реф ссылка"), KeyboardButton(text="ℹ️ О проекте")]
+        ],
+        resize_keyboard=True
+    )
+    
+    await message.answer("Главное меню:", reply_markup=main_keyboard)
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+
+async def save_quiz_answer(tg_id: int, question_id: str, answer: str):
+    """Сохраняет ответ на вопрос квиза"""
+    try:
+        user = await get_user_by_tg_id(tg_id)
+        if user:
+            async with AsyncSessionLocal() as session:
+                quiz_answer = QuizAnswer(
+                    user_id=user.id,
+                    question_id=question_id,
+                    answer=answer
+                )
+                session.add(quiz_answer)
+                await session.commit()
+                logger.info(f"💾 Сохранен ответ: {question_id} = {answer}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения ответа: {e}")
 
 async def notify_managers(message: str):
     """Отправляет уведомление менеджерам"""
@@ -382,19 +575,23 @@ async def stats_command(message: types.Message):
         return
     
     async with AsyncSessionLocal() as session:
+        from sqlalchemy import select, text
+        
         # Статистика пользователей
-        users_count = await session.execute("SELECT COUNT(*) FROM users")
+        users_count = await session.execute(text("SELECT COUNT(*) FROM users"))
         users_total = users_count.scalar()
         
-        paid_users = await session.execute("SELECT COUNT(*) FROM users WHERE status = 'paid'")
+        paid_users = await session.execute(text("SELECT COUNT(*) FROM users WHERE status = 'paid'"))
         paid_total = paid_users.scalar()
         
         # Статистика заказов
-        orders_count = await session.execute("SELECT COUNT(*) FROM orders")
+        orders_count = await session.execute(text("SELECT COUNT(*) FROM orders"))
         orders_total = orders_count.scalar()
         
-        paid_orders = await session.execute("SELECT COUNT(*) FROM orders WHERE payment_status = 'paid'")
+        paid_orders = await session.execute(text("SELECT COUNT(*) FROM orders WHERE payment_status = 'paid'"))
         paid_orders_total = paid_orders.scalar()
+    
+    conversion = round((paid_total/users_total)*100, 2) if users_total > 0 else 0
     
     stats_text = (
         f"📊 Статистика бота:\n\n"
@@ -402,12 +599,10 @@ async def stats_command(message: types.Message):
         f"💰 Оплатившие: {paid_total}\n"
         f"📦 Заказы: {orders_total}\n"
         f"✅ Оплаченные заказы: {paid_orders_total}\n"
-        f"💵 Конверсия: {round((paid_total/users_total)*100, 2) if users_total > 0 else 0}%"
+        f"💵 Конверсия: {conversion}%"
     )
     
     await message.answer(stats_text)
-
-# ========== ЗАГРУЗЧИК КОНТЕНТА ==========
 
 @dp.message(Command("upload_content"))
 async def upload_content_handler(message: types.Message):
@@ -433,26 +628,31 @@ async def upload_content_handler(message: types.Message):
     else:
         await message.answer("📎 Отправьте CSV файл с контентом")
 
-# ========== ОБРАБОТЧИКИ КВИЗА ==========
+# ========== ОБРАБОТЧИК НЕИЗВЕСТНЫХ СООБЩЕНИЙ ==========
 
-@dp.message(F.text == "🧪 Начать тест")
-async def start_quiz_handler(message: types.Message, state: FSMContext):
-    """Начало квиза"""
-    await message.answer(
-        "🧪 Отлично! Начинаем тест...\n\n"
-        "❓ Вопрос 1: Как часто вы чувствуете усталость?",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="😫 Часто"), KeyboardButton(text="😐 Иногда")],
-                [KeyboardButton(text="😊 Редко"), KeyboardButton(text="🎉 Никогда")],
-                [KeyboardButton(text="🔙 Назад")]
-            ],
-            resize_keyboard=True
-        )
+@dp.message()
+async def unknown_message_handler(message: types.Message):
+    """Обработчик неизвестных сообщений"""
+    logger.info(f"❓ Неизвестное сообщение от {message.from_user.id}: {message.text}")
+    
+    main_keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🧪 Начать тест")],
+            [KeyboardButton(text="💰 Оплатить анализ"), KeyboardButton(text="👤 Профиль")],
+            [KeyboardButton(text="🔗 Моя реф ссылка"), KeyboardButton(text="ℹ️ О проекте")]
+        ],
+        resize_keyboard=True
     )
-    await state.set_state(QuizStates.answering_questions)
-
-# Добавьте обработчики для вопросов квиза аналогично предыдущей версии
+    
+    await message.answer(
+        "🤔 Используйте кнопки меню для навигации:\n\n"
+        "• 🧪 Начать тест - пройти опрос о здоровье\n"
+        "• 💰 Оплатить анализ - оформить заказ\n" 
+        "• 👤 Профиль - посмотреть ваши данные\n"
+        "• 🔗 Моя реф ссылка - пригласить друзей\n"
+        "• ℹ️ О проекте - узнать о GenoLife",
+        reply_markup=main_keyboard
+    )
 
 # ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 
@@ -466,6 +666,9 @@ async def main():
         # Загружаем контент
         content_manager.load_content()
         logger.info("✅ Контент загружен")
+        
+        # Тестовое сообщение админу
+        await bot.send_message(config.ADMIN_ID, "🤖 Бот GenoLife запущен и готов к работе!")
         
         await dp.start_polling(bot)
         
